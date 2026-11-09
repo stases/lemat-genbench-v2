@@ -10,6 +10,7 @@ import gc
 import multiprocessing
 import warnings
 from dataclasses import dataclass, field
+from numbers import Integral, Real
 from typing import Any, Dict, List
 
 import numpy as np
@@ -17,7 +18,11 @@ import torch
 from func_timeout import FunctionTimedOut, func_timeout
 from pymatgen.core import Structure
 
-from lemat_genbench.preprocess.base import BasePreprocessor, PreprocessorConfig
+from lemat_genbench.preprocess.base import (
+    BasePreprocessor,
+    PreprocessorConfig,
+    PreprocessorResult,
+)
 from lemat_genbench.utils.logging import logger
 
 multiprocessing.set_start_method("spawn", force=True)
@@ -110,6 +115,16 @@ def _get_or_create_calculator(mlip_name: str, mlip_config: Dict[str, Any]):
     return cache[cache_key]
 
 
+_BATCHED_DEFAULTS = {
+    "workers_per_model": 8,
+    "structures_per_worker": 32,
+    "max_atoms_per_worker": None,
+    "geometry_tolerance": None,
+    "uma_fixes": True,
+    "max_requests": 1000,
+}
+
+
 def _merge_model_config(mlip_name, mlip_config):
     """Apply the same model defaults for logging and both execution modes."""
     defaults = {
@@ -118,6 +133,39 @@ def _merge_model_config(mlip_name, mlip_config):
         "uma": {"task": "omat", "device": "cpu"},
     }
     return {**defaults.get(mlip_name, {"device": "cpu"}), **mlip_config}
+
+
+def _validate_execution_settings(execution_mode, matmul_precision, batched):
+    if execution_mode not in ("per_structure", "batched"):
+        raise ValueError("execution_mode must be 'per_structure' or 'batched'")
+    if matmul_precision not in ("highest", "high", "medium"):
+        raise ValueError("matmul_precision must be 'highest', 'high' or 'medium'")
+    unknown = batched.keys() - _BATCHED_DEFAULTS.keys()
+    if unknown:
+        raise ValueError(f"Unknown batched keys: {', '.join(map(str, unknown))}")
+    for key in (
+        "workers_per_model",
+        "structures_per_worker",
+        "max_requests",
+        "max_atoms_per_worker",
+    ):
+        value = batched[key]
+        if key == "max_atoms_per_worker" and value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+    tolerance = batched["geometry_tolerance"]
+    if tolerance is not None:
+        if (
+            isinstance(tolerance, bool)
+            or not isinstance(tolerance, Real)
+            or not tolerance > 0
+        ):
+            raise ValueError("geometry_tolerance must be None or a positive real")
+        if matmul_precision != "highest":
+            raise ValueError("geometry_tolerance requires matmul_precision='highest'")
+    if not isinstance(batched["uma_fixes"], bool):
+        raise ValueError("uma_fixes must be a bool")
 
 
 def _initialize_worker_models(
@@ -161,9 +209,13 @@ class MultiMLIPStabilityPreprocessorConfig(PreprocessorConfig):
     extract_embeddings : bool
         Whether to extract embeddings
     timeout : int
-        Timeout per structure per MLIP (seconds)
+        Timeout per structure per MLIP (seconds) in per_structure mode
+    execution_mode : str
+        per_structure (default) or batched model passes
     matmul_precision : str
         Float32 matmul precision, enforced after loading models (default: highest)
+    batched : Dict[str, Any]
+        Worker, batch, geometry reuse and relaxation request settings
     """
 
     mlip_names: List[str] = field(default_factory=lambda: ["orb", "mace", "uma"])
@@ -176,7 +228,9 @@ class MultiMLIPStabilityPreprocessorConfig(PreprocessorConfig):
     calculate_energy_above_hull: bool = True
     extract_embeddings: bool = True
     timeout: int = 300
+    execution_mode: str = "per_structure"
     matmul_precision: str = "highest"
+    batched: Dict[str, Any] = field(default_factory=lambda: dict(_BATCHED_DEFAULTS))
 
 
 class MultiMLIPStabilityPreprocessor(BasePreprocessor):
@@ -203,9 +257,13 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
     extract_embeddings : bool
         Whether to extract embeddings
     timeout : int
-        Timeout per structure per MLIP (seconds)
+        Timeout per structure per MLIP (seconds) in per_structure mode
+    execution_mode : str
+        per_structure (default) or batched model passes
     matmul_precision : str
         Float32 matmul precision, enforced after loading models (default: highest)
+    batched : Dict[str, Any]
+        Worker, batch, geometry reuse and relaxation request settings
     name : str, optional
         Custom name for the preprocessor
     description : str, optional
@@ -228,14 +286,20 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
         description: str = None,
         n_jobs: int = 4,  # Use 4 cores to balance speed and memory
         *,
+        execution_mode: str = "per_structure",
         matmul_precision: str = "highest",
+        batched: Dict[str, Any] = None,
     ):
-        if matmul_precision not in ("highest", "high", "medium"):
-            raise ValueError("matmul_precision must be 'highest', 'high' or 'medium'")
+        batched = {**_BATCHED_DEFAULTS, **(batched if batched is not None else {})}
+        _validate_execution_settings(execution_mode, matmul_precision, batched)
 
         # Set defaults
         if mlip_names is None:
             mlip_names = ["orb", "mace", "uma"]
+        if execution_mode == "batched":
+            for mlip_name in mlip_names:
+                if mlip_name not in ("orb", "mace", "uma"):
+                    raise ValueError(f"Unknown batched MLIP: {mlip_name!r}")
         if mlip_configs is None:
             mlip_configs = {}
         if relaxation_config is None:
@@ -265,11 +329,20 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             calculate_energy_above_hull=calculate_energy_above_hull,
             extract_embeddings=extract_embeddings,
             timeout=timeout,
+            execution_mode=execution_mode,
             matmul_precision=matmul_precision,
+            batched=batched,
         )
 
         # Configure models (will be loaded in each worker process)
         _initialize_worker_models(self.config.mlip_names, self.config.mlip_configs)
+
+    def run(self, structures: list[Structure]) -> PreprocessorResult:
+        if self.config.execution_mode == "batched":
+            from lemat_genbench.batched.stage import run_batched_stage
+
+            return run_batched_stage(structures, self.config)
+        return super().run(structures)
 
     def _get_process_attributes(self) -> Dict[str, Any]:
         """Get the attributes for the process_structure method."""
