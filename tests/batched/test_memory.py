@@ -273,8 +273,21 @@ def test_nonmemory_failures_are_deferred_and_counted(
     (summary,) = [message for message in messages if "Batched pass:" in message]
     assert summary.endswith(
         f"retries=0, deferred={int(capped)}, "
-        f"recovered={int(capped and computed)}, lost={int(capped and not computed)}"
+        f"recovered={int(capped and computed)}, lost={int(not computed)}, "
+        "memory_lost=0, unconverged=0"
     )
-    # Broader missing-value warnings belong to the next round.
-    assert result.warnings == []
+    expected = (
+        []
+        if computed
+        else [
+            f"[mace] structure 0: {phase} failed: "
+            + (
+                "opaque batched failure"
+                if phase == "single_point"
+                else "opaque embedding failure"
+            )
+        ]
+    )
+    assert result.warnings == expected
+    assert all(messages.count(warning) == 1 for warning in expected)
     assert multiprocessing.active_children() == []

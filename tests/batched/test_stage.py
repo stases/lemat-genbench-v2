@@ -494,7 +494,8 @@ def assert_reference_is_informative(result, structures, stability, embeddings):
         for name in MLIPS:
             keys = {k for k in props if k.endswith(f"_{name}")}
             if SINGLE_POINT_FAULT.get(name) in elements and name != "mace":
-                assert not keys, (name, keys)  # the model's whole result is dropped
+                # The model's whole result is dropped; only the reason is kept.
+                assert keys == {f"mlip_error_{name}"}, (name, keys)
                 continue
             single_point_ok = SINGLE_POINT_FAULT.get(name) not in elements
             hull_ok = HULL_GAP.get(name) not in elements

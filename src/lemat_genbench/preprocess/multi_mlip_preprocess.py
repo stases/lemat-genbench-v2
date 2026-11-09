@@ -488,6 +488,7 @@ def _merge_mlip_results(
     vector_metrics = {"forces": []}
     for mlip_name, result in mlip_results.items():
         if "error" in result:
+            structure.properties[f"mlip_error_{mlip_name}"] = result["error"]
             continue
         for metric_name in scalar_metrics:
             if metric_name in result and result[metric_name] is not None:

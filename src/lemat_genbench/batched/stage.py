@@ -7,7 +7,7 @@ import traceback
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
-from math import floor
+from math import floor, isfinite
 from multiprocessing.connection import Connection, wait
 
 import torch
@@ -176,7 +176,11 @@ def _relaxations(connection, name, calculator, model, config, memory, final):
                     connection,
                     "relaxation",
                     index,
-                    {"error": str(exc), "_memory_error": memory_error(exc)},
+                    {
+                        "error": str(exc),
+                        "_memory_error": memory_error(exc),
+                        "converged": False,
+                    },
                     final,
                 )
                 continue
@@ -206,6 +210,7 @@ def _relaxations(connection, name, calculator, model, config, memory, final):
                 "atoms": outcome.atoms,
                 "energy": outcome.energy,
                 "steps": outcome.steps,
+                "converged": outcome.converged,
                 "error": outcome.error,
                 "cache_hits": outcome.cache_hits,
                 "_memory_error": outcome.memory_error,
@@ -328,15 +333,21 @@ def _close_worker(worker, terminate=False):
     worker.process.close()
 
 
-def _energy_properties(result, energy, composition, hull_type, config, prefix=""):
+def _energy_properties(
+    result, energy, composition, hull_type, config, report, prefix=""
+):
     """Hull reference tables and all derived energies stay in the main process."""
     if config.calculate_formation_energy:
         try:
             result[prefix + "formation_energy"] = multi._detach_tensors(
                 get_formation_energy_per_atom_from_total_energy(energy, composition)
             )
-        except Exception:
+        except Exception as exc:
             result[prefix + "formation_energy"] = None
+            report(prefix + "formation_energy", exc)
+        else:
+            if result[prefix + "formation_energy"] is None:
+                report(prefix + "formation_energy", "calculation returned None")
     if config.calculate_energy_above_hull:
         try:
             result[prefix + "e_above_hull"] = multi._detach_tensors(
@@ -344,11 +355,15 @@ def _energy_properties(result, energy, composition, hull_type, config, prefix=""
                     energy, composition, hull_type=hull_type
                 )
             )
-        except Exception:
+        except Exception as exc:
             result[prefix + "e_above_hull"] = None
+            report(prefix + "e_above_hull", exc)
+        else:
+            if result[prefix + "e_above_hull"] is None:
+                report(prefix + "e_above_hull", "calculation returned None")
 
 
-def _relaxation_properties(structure, outcome, hull_type, config):
+def _relaxation_properties(structure, outcome, hull_type, config, report):
     result = {}
     try:
         if outcome["error"] is not None:
@@ -368,11 +383,13 @@ def _relaxation_properties(structure, outcome, hull_type, config):
             relaxed.composition,
             hull_type,
             config,
+            report,
             prefix="relaxed_",
         )
     except Exception as exc:
         result["relaxation_failed"] = True
         result["relaxation_error"] = outcome["error"] or str(exc)
+        report("relaxation", exc)
     return result
 
 
@@ -438,6 +455,10 @@ def _run_model_pass(structures, name, config, warnings):
         phases.append("relaxation")
     pending = {phase: deque(range(len(structures))) for phase in phases}
     deferred = {phase: {} for phase in phases}
+    outcomes = {phase: {} for phase in phases}
+    # Keep the first cause for each missing phase/quantity and emit it once,
+    # after retries and any whole-model drops have reached their final outcome.
+    failures = {}
     completed = dict.fromkeys(phases, 0)
     next_progress = dict.fromkeys(phases, 10)
     results = [{} for _ in structures]
@@ -445,9 +466,32 @@ def _run_model_pass(structures, name, config, warnings):
     workers = []
     deaths = relaxation_errors = request_caps = 0
     oom_errors = dict.fromkeys(("single_point", "embedding", "relaxation", "load"), 0)
-    deferred_count = recovered = lost = 0
+    deferred_count = recovered = unconverged = 0
     assignment = None
     final = False
+    hull_warmed = False
+
+    def report(index, quantity, error, is_memory=False, after_retry=False):
+        failures.setdefault(
+            (index, quantity),
+            (str(error), is_memory or memory_error(error), after_retry),
+        )
+
+    def warm_hull():
+        nonlocal hull_warmed
+        if hull_warmed or not config.calculate_energy_above_hull:
+            return
+        hull_type = multi._merge_model_config(
+            name, config.mlip_configs.get(name, {})
+        ).get("hull_type", "dft")
+        try:
+            reference_energies._retrieve_df(hull_type)
+            reference_energies._retrieve_matrix(hull_type)
+        except Exception as exc:
+            raise RuntimeError(
+                f"[{name}] Could not load hull table {hull_type}: {exc}"
+            ) from exc
+        hull_warmed = True
 
     def requeue(worker):
         for phase, indices in worker.held.items():
@@ -485,6 +529,8 @@ def _run_model_pass(structures, name, config, warnings):
                     workers.append(
                         _start_worker(context, name, config, assignment, final)
                     )
+                    # A failed memory probe never reached the normal warm-up.
+                    warm_hull()
                 else:
                     break
             ready = wait(
@@ -528,19 +574,8 @@ def _run_model_pass(structures, name, config, warnings):
                             workers.append(
                                 _start_worker(context, name, config, assignment)
                             )
-                        if config.calculate_energy_above_hull:
-                            hull_type = multi._merge_model_config(
-                                name, config.mlip_configs.get(name, {})
-                            ).get("hull_type", "dft")
-                            # Workers have their shares and can load during warm-up.
-                            for retrieve in (
-                                reference_energies._retrieve_df,
-                                reference_energies._retrieve_matrix,
-                            ):
-                                try:
-                                    retrieve(hull_type)
-                                except Exception:
-                                    pass
+                        # Workers have their shares and can load during warm-up.
+                        warm_hull()
                     elif kind == "ready":
                         worker.metadata = message[1]
                     elif kind == "memory_error":
@@ -561,37 +596,37 @@ def _run_model_pass(structures, name, config, warnings):
                         del worker.held[phase][index]
                         result = results[index]
                         metadata = worker.metadata
-                        error = data.pop("_error", None) or data.get("error")
+                        error = data.pop("_error", None)
+                        if error is None:
+                            error = data.get("error")
                         is_oom = data.pop("_memory_error", False) or memory_error(error)
                         if kind == "deferred":
                             deferred[phase][index] = error
                             deferred_count += 1
                             continue
-                        if final and is_oom:
-                            warning = (
-                                f"[{name}] structure {index}: {phase} lost after "
-                                f"retrying with the whole GPU: {error}"
+                        outcomes[phase][index] = (error, is_oom, final)
+
+                        def report_property(quantity, exc):
+                            report(
+                                index,
+                                quantity,
+                                exc,
+                                is_memory=is_oom if quantity == phase else False,
+                                after_retry=final if quantity == phase else False,
                             )
-                            warnings.append(warning)
-                            logger.warning(warning)
-                        if final and index in deferred[phase]:
-                            fields = {
-                                "single_point": ("energy",),
-                                "embedding": ("node_embeddings", "graph_embedding"),
-                                "relaxation": ("atoms", "energy"),
-                            }[phase]
-                            computed = not error and all(
-                                data.get(key) is not None for key in fields
+
+                        if phase == "relaxation":
+                            request_caps += bool(
+                                error and error.startswith("max_requests (")
                             )
-                            recovered += computed
-                            lost += not computed
-                        elif final and is_oom:
-                            lost += 1
-                        if error:
-                            if is_oom or phase == "embedding":
-                                logger.warning(
-                                    f"[{name}] Structure {index} {phase} failed: {error}"
-                                )
+                            unconverged += bool(
+                                error is None
+                                and data.get("atoms") is not None
+                                and data.get("energy") is not None
+                                and not data["converged"]
+                                and data["steps"]
+                                >= config.relaxation_config.get("steps", 50)
+                            )
                         # A dropped model result needs no relaxation properties.
                         if phase == "relaxation" and "error" not in result:
                             if settings["geometry_tolerance"] is not None and data.get(
@@ -600,20 +635,16 @@ def _run_model_pass(structures, name, config, warnings):
                                 logger.info(
                                     f"[{name}] Structure {index}: {data['cache_hits']} cache hits"
                                 )
-                            request_caps += bool(
-                                data["error"]
-                                and data["error"].startswith("max_requests (")
-                            )
                             data = _relaxation_properties(
-                                structures[index], data, metadata["hull_type"], config
+                                structures[index],
+                                data,
+                                metadata["hull_type"],
+                                config,
+                                report_property,
                             )
                             relaxation_errors += bool(data.get("relaxation_failed"))
                         if "error" not in result:
                             if "error" in data:
-                                logger.warning(
-                                    f"[{name}] Structure {index} dropped for this model: "
-                                    f"{data['error']}"
-                                )
                                 results[index] = data
                             else:
                                 result.update(
@@ -630,6 +661,7 @@ def _run_model_pass(structures, name, config, warnings):
                                         structures[index].composition,
                                         metadata["hull_type"],
                                         config,
+                                        report_property,
                                     )
                         completed[phase] += 1
                         percent = 100 * completed[phase] // len(structures)
@@ -673,6 +705,46 @@ def _run_model_pass(structures, name, config, warnings):
     finally:
         for worker in workers:
             _close_worker(worker, terminate=True)
+
+    fields_by_phase = {
+        "single_point": ("energy", "forces"),
+        "embedding": ("node_embeddings", "graph_embedding"),
+        "relaxation": ("relaxed_structure", "relaxation_energy"),
+    }
+    for index, result in enumerate(results):
+        for phase in phases:
+            missing = [key for key in fields_by_phase[phase] if result.get(key) is None]
+            if not missing and not (
+                phase == "relaxation" and result.get("relaxation_failed")
+            ):
+                recovered += index in deferred[phase]
+                continue
+            error, is_oom, after_retry = outcomes[phase][index]
+            if error is None and "error" in result:
+                # Dropping a model also discards its other phase values, even
+                # when those calls succeeded. Preserve the cause of that loss.
+                error, is_oom, after_retry = outcomes["single_point"][index]
+                error = result["error"]
+            if error is None:
+                error = f"missing {', '.join(missing)}"
+            report(index, phase, error, is_oom, after_retry)
+        energy = result.get("energy")
+        if energy is not None and not isfinite(energy):
+            warning = f"[{name}] structure {index}: single_point energy is not finite: {energy}"
+            warnings.append(warning)
+            logger.warning(warning)
+
+    for (index, quantity), (error, is_oom, after_retry) in failures.items():
+        reason = (
+            "lost after retrying with the whole GPU"
+            if is_oom and after_retry
+            else "failed"
+        )
+        warning = f"[{name}] structure {index}: {quantity} {reason}: {error}"
+        warnings.append(warning)
+        logger.warning(warning)
+    lost = len(failures)
+    memory_lost = sum(is_oom for _, is_oom, _ in failures.values())
     elapsed = time.monotonic() - start
     log = logger.warning if deferred_count or lost else logger.info
     log(
@@ -682,7 +754,8 @@ def _run_model_pass(structures, name, config, warnings):
         f"out-of-memory errors: {oom_errors['single_point']} single points, "
         f"{oom_errors['embedding']} embeddings, {oom_errors['relaxation']} relaxations; "
         f"retries={sum(oom_errors.values())}, deferred={deferred_count}, "
-        f"recovered={recovered}, lost={lost}"
+        f"recovered={recovered}, lost={lost}, memory_lost={memory_lost}, "
+        f"unconverged={unconverged}"
     )
     return results
 
@@ -696,7 +769,7 @@ def run_batched_stage(
     Workers extract embeddings before applying UMA fixes. CUDA runtime errors
     kill the worker. Capped workers defer failed single points and embeddings;
     relaxation failures are deferred only for memory errors. A final worker runs
-    deferred phases without a share. Remaining memory losses become result warnings.
+    deferred phases without a share. Every remaining loss becomes a result warning.
     The first worker death re-queues held work and starts one replacement; a
     second death propagates. Empty input starts no processes and loads no models.
     """
