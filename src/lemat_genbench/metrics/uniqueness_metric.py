@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 from pymatgen.core import Structure
 from tqdm import tqdm
 
+from lemat_genbench.fingerprinting.reference_index import CompositionGroups
 from lemat_genbench.fingerprinting.utils import get_fingerprint, get_fingerprinter
 from lemat_genbench.metrics.base import BaseMetric, MetricConfig, MetricResult
 from lemat_genbench.utils.logging import logger
@@ -162,6 +163,7 @@ class UniquenessMetric(BaseMetric):
             if "structure-matcher" in self.config.fingerprint_method.lower():
                 fingerprinter = compute_args["fingerprinter"]
                 count_unique = 0
+                groups = CompositionGroups(structures)
 
                 individual_values = []
                 for i, structure1 in tqdm(
@@ -170,18 +172,12 @@ class UniquenessMetric(BaseMetric):
                     disable=not self.verbose,
                 ):
                     is_unique = True
-                    # min_distance = float("inf")
-                    for j, structure2 in enumerate(structures):
-                        if i < j:
-                            is_equivalent = fingerprinter.is_equivalent(
-                                structure1, structure2
-                            )
-                            # similarity = fingerprinter.get_similarity_score(structure1, structure2)
-                            # distance = 1 - similarity
-                            # min_distance = min(min_distance, distance)
-                            if is_equivalent:
-                                is_unique = False
-                    # individual_values.append(min_distance)
+                    for j in groups.candidates(i):
+                        is_equivalent = fingerprinter.is_equivalent(
+                            structure1, structures[j]
+                        )
+                        if is_equivalent:
+                            is_unique = False
                     if is_unique:
                         count_unique += 1
 

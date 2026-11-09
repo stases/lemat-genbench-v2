@@ -1,5 +1,6 @@
 """Small reference-cache and comparison-failure regressions."""
 
+import multiprocessing
 import os
 import pickle
 from pathlib import Path
@@ -11,6 +12,10 @@ from datasets import Dataset, concatenate_datasets
 from pymatgen.core import Lattice, Structure
 
 from lemat_genbench.fingerprinting import reference_index
+from lemat_genbench.fingerprinting.utils import get_fingerprinter
+from lemat_genbench.metrics.novelty_metric import NoveltyMetric
+from lemat_genbench.metrics.sun_metric import SUNMetric
+from lemat_genbench.metrics.uniqueness_metric import UniquenessMetric
 
 
 def _row(species, elements):
@@ -144,6 +149,33 @@ def test_disk_cache_metadata_invalidation(cached_reference, field):
     np.testing.assert_array_equal(rebuilt.candidates(index.structure(0)), [0])
 
 
+def test_novelty_spawn_matches_serial(cached_reference):
+    row = _row(["Na", "Cl"], ["Na", "Cl"])
+    row["cartesian_site_positions"] = [[0, 0, 0], [0.5, 0.5, 0.5]]
+    cached_reference.return_value = Dataset.from_list([row])
+    structures = [
+        Structure(Lattice.cubic(1), species, row["cartesian_site_positions"])
+        for species in (["Na", "Cl"], ["K", "Br"])
+    ]
+    settings = {
+        "fingerprint_method": "structure-matcher",
+        "reference_dataset": "test/reference",
+        "reference_config": "config",
+    }
+    serial = NoveltyMetric(**settings).compute(structures)
+    assert serial.individual_values == [0.0, 1.0]
+    reference_index.get_reference_index.cache_clear()
+    previous = multiprocessing.get_start_method(allow_none=True)
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+        parallel = NoveltyMetric(**settings, n_jobs=2).compute(structures)
+    finally:
+        multiprocessing.set_start_method(previous, force=True)
+    np.testing.assert_array_equal(parallel.individual_values, serial.individual_values)
+    assert parallel.failed_indices == []
+    assert cached_reference.call_count == 2
+
+
 def test_chunked_rows_metadata_and_fallback(monkeypatch):
     original_iter = Dataset.iter
 
@@ -163,3 +195,52 @@ def test_chunked_rows_metadata_and_fallback(monkeypatch):
     empty = reference_index.ReferenceIndex(dataset, 0)
     assert len(empty.candidates(disordered)) == 0
     assert len(empty.candidates(index.structure(1))) == 0
+
+
+def test_cache_distinguishes_content_and_matcher_settings(cached_reference):
+    index = reference_index.get_reference_index("test/reference", "config", None)
+    structure = index.structure(0)
+    fingerprinter = get_fingerprinter("structure-matcher")
+    fingerprinter.is_equivalent = Mock(return_value=False)
+    info = {"reference_index": index}
+    assert NoveltyMetric.compute_structure(structure, info, fingerprinter) == 1.0
+    copied = structure.copy()
+    copied.properties["e_above_hull_mean"] = 0.0
+    assert NoveltyMetric.compute_structure(copied, info, fingerprinter) == 1.0
+    assert fingerprinter.is_equivalent.call_count == 1
+
+    changed = structure.copy()
+    changed.translate_sites([0], [0.01, 0, 0])
+    NoveltyMetric.compute_structure(changed, info, fingerprinter)
+    changed = structure.copy()
+    changed.scale_lattice(2)
+    NoveltyMetric.compute_structure(changed, info, fingerprinter)
+    changed = structure.copy()
+    changed.add_oxidation_state_by_element({"Na": 1, "Cl": -1})
+    NoveltyMetric.compute_structure(changed, info, fingerprinter)
+    assert fingerprinter.is_equivalent.call_count == 4
+
+    fingerprinter.matcher.ltol = 0.2
+    fingerprinter.is_equivalent.side_effect = ValueError("comparison failed")
+    assert np.isnan(NoveltyMetric.compute_structure(structure, info, fingerprinter))
+    # A failed check is not cached: it is retried and logged again, as before.
+    assert np.isnan(NoveltyMetric.compute_structure(structure, info, fingerprinter))
+    assert fingerprinter.is_equivalent.call_count == 6
+
+
+def test_uniqueness_failure_semantics():
+    structure = Structure(Lattice.cubic(3), ["Na"], [[0, 0, 0]])
+    structures = [structure, structure.copy(), structure.copy()]
+    metric = UniquenessMetric(fingerprint_method="structure-matcher")
+    metric.fingerprinter.is_equivalent = Mock(side_effect=[True, ValueError("failed")])
+    result = metric.compute(structures)
+    assert result.failed_indices == [0, 1, 2]
+    assert all(np.isnan(value) for value in result.individual_values)
+    assert metric.fingerprinter.is_equivalent.call_count == 2
+
+    sun = SUNMetric(fingerprint_method="structure-matcher")
+    sun.uniqueness_metric.fingerprinter.is_equivalent = Mock(
+        side_effect=[ValueError("failed"), False, True]
+    )
+    assert sun._compute_uniqueness_within_set(structures) == [0, 1]
+    assert sun.uniqueness_metric.fingerprinter.is_equivalent.call_count == 3

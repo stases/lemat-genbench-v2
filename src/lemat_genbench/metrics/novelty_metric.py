@@ -7,20 +7,19 @@ Uses LeMat-Bulk dataset and BAWL fingerprinting.
 
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from datasets import load_dataset
 from pymatgen.core import Structure
 from tqdm import tqdm
 
-from lemat_genbench.fingerprinting.encode_compositions import (
-    filter_df,
-    get_all_compositions,
-    lematbulk_item_to_structure,
+from lemat_genbench.fingerprinting.reference_index import (
+    get_reference_index,
+    novelty_cache_key,
 )
 from lemat_genbench.fingerprinting.utils import get_fingerprint, get_fingerprinter
-from lemat_genbench.metrics.base import BaseMetric, MetricConfig
+from lemat_genbench.metrics.base import BaseMetric, MetricConfig, MetricResult
 from lemat_genbench.utils.logging import logger
 
 warnings.filterwarnings("ignore", message="No oxidation states specified on sites!")
@@ -128,7 +127,7 @@ class NoveltyMetric(BaseMetric):
         self._init_fingerprinter()
 
         # Cache for reference fingerprints
-        self._dataset_information: Optional[Set[str]] = None
+        self._dataset_information: Optional[dict[str, Any]] = None
         self._reference_loaded = False
 
     def _init_fingerprinter(self) -> None:
@@ -160,6 +159,19 @@ class NoveltyMetric(BaseMetric):
 
         dataset_information = {}
         try:
+            if self.config.fingerprint_method.lower() == "structure-matcher":
+                dataset_information = {
+                    "reference_index": get_reference_index(
+                        self.config.reference_dataset,
+                        self.config.reference_config,
+                        self.config.max_reference_size,
+                    )
+                }
+                if self.config.cache_reference:
+                    self._dataset_information = dataset_information
+                    self._reference_loaded = True
+                return dataset_information
+
             # Load the dataset
             dataset = load_dataset(
                 self.config.reference_dataset,
@@ -195,34 +207,6 @@ class NoveltyMetric(BaseMetric):
                 logger.info(
                     f"Loaded {len(fingerprints)} unique fingerprints from reference dataset"
                 )
-
-            elif self.config.fingerprint_method.lower() in ["structure-matcher"]:
-                df = dataset.select_columns(
-                    ["immutable_id", "chemical_formula_descriptive"]
-                ).to_pandas()
-                df = df.set_index("immutable_id")
-                df["index_number"] = np.arange(len(df))
-
-                dataset = load_dataset(
-                    "LeMaterial/LeMat-Bulk",
-                    "compatible_pbe",
-                    split="train",
-                    columns=[
-                        "elements",
-                        "immutable_id",
-                        "chemical_formula_descriptive",
-                        "energy",
-                        "species_at_sites",
-                        "cartesian_site_positions",
-                        "lattice_vectors",
-                    ],
-                )
-
-                all_compositions = get_all_compositions()
-
-                dataset_information["dataset_dataframe"] = df
-                dataset_information["all_compositions"] = all_compositions
-                dataset_information["dataset"] = dataset
 
             elif hasattr(self.fingerprinter, "get_material_hash"):
                 logger.info("Computing fingerprints for reference dataset structures")
@@ -302,6 +286,34 @@ class NoveltyMetric(BaseMetric):
             "verbose": self.verbose,
         }
 
+    def compute(self, structures: list[Structure], **compute_args: Any) -> MetricResult:
+        """Compute novelty and retain results produced by worker processes.
+
+        Parameters
+        ----------
+        structures : list[Structure]
+            Structures to evaluate.
+        **compute_args : Any
+            Additional arguments accepted by the base metric.
+
+        Returns
+        -------
+        MetricResult
+            Novelty values and aggregate metrics.
+        """
+        result = super().compute(structures, **compute_args)
+        if (
+            self.config.n_jobs > 1
+            and self.config.fingerprint_method.lower() == "structure-matcher"
+        ):
+            index = self._load_reference_dataset()["reference_index"]
+            failed = set(result.failed_indices)
+            for i, value in enumerate(result.individual_values):
+                if i not in failed and not np.isnan(value):
+                    key = novelty_cache_key(structures[i], self.fingerprinter)
+                    index.novelty_cache[key] = value
+        return result
+
     @staticmethod
     def compute_structure(
         structure: Structure,
@@ -340,27 +352,17 @@ class NoveltyMetric(BaseMetric):
                 is_novel = fingerprint not in dataset_information["fingerprints"]
 
             else:
-                # For comparison-based matchers
-                df_filtered = filter_df(
-                    dataset_information["dataset_dataframe"],
-                    dataset_information["all_compositions"],
-                    structure,
-                )
-                dataset_select = dataset_information["dataset"].select(
-                    dataset_information["dataset_dataframe"].loc[df_filtered.index][
-                        "index_number"
-                    ]
-                )
-                is_equivalent = False
-
-                for item in tqdm(dataset_select, disable=not verbose):
-                    ref_structure = lematbulk_item_to_structure(item)
-                    _is_equivalent = fingerprinter.is_equivalent(
-                        structure, ref_structure
-                    )
-                    is_equivalent = is_equivalent or _is_equivalent
-
-                is_novel = not is_equivalent
+                index = dataset_information["reference_index"]
+                cache_key = novelty_cache_key(structure, fingerprinter)
+                if cache_key in index.novelty_cache:
+                    return index.novelty_cache[cache_key]
+                is_novel = True
+                for row in tqdm(index.candidates(structure), disable=not verbose):
+                    ref_structure = index.structure(row)
+                    if fingerprinter.is_equivalent(structure, ref_structure):
+                        is_novel = False
+                        break
+                index.novelty_cache[cache_key] = 1.0 if is_novel else 0.0
 
             return 1.0 if is_novel else 0.0
 
