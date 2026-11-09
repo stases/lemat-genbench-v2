@@ -183,9 +183,17 @@ Relaxations follow the same protocol as before (ASE `BFGSLineSearch` with
 own optimizer, only the model calls are batched, and a finished relaxation's slot is
 given to the next structure. Embeddings are still extracted one structure at a time.
 
+Batched mode divides the GPU's free memory equally between workers after reserving
+memory for CUDA and other processes. It reduces the worker count when needed, and
+`max_atoms_per_worker: auto` sizes each worker's atom budget from its share; a
+positive integer sets a fixed initial budget and `null` starts without one. On CPU,
+`auto` has no atom budget. Batches that run out of memory are split and the worker
+lowers its budget to a size that succeeded. Structures that still fail alone are
+retried by one final worker with the whole GPU, restarting relaxations from the input.
+Any remaining memory losses appear in warnings and the pass summary.
+
 Batched mode does not use `n_jobs` (`MLIP_PREPROCESSOR_N_JOBS` in the runner) or
-the per-structure `timeout`, and its GPU memory grows with `workers_per_model` and
-`structures_per_worker`. Instead of a timeout, each relaxation is limited to
+the per-structure `timeout`. Instead of a timeout, each relaxation is limited to
 `max_requests` model calls; reaching it is recorded as a failed relaxation, as a
 line-search failure is. A worker process that dies is replaced once and its
 unfinished structures are run again; a second death stops the run. `uma_fixes` replaces two slow parts of fairchem's UMA code
@@ -205,8 +213,8 @@ preprocessor_config:
   matmul_precision: highest
   batched:
     workers_per_model: 8
-    structures_per_worker: 32
-    max_atoms_per_worker: null
+    structures_per_worker: 16
+    max_atoms_per_worker: auto
     geometry_tolerance: null
     uma_fixes: true
     max_requests: 1000

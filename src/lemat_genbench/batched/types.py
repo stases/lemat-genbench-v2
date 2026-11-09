@@ -37,3 +37,4 @@ class RelaxOutcome:
     error: str | None  # None on success; the failure text otherwise
     model_calls: int  # predictions the model computed for this structure
     cache_hits: int  # requests answered by the geometry-tolerance check
+    memory_error: bool = False  # retain classification when an exception becomes text

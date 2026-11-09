@@ -13,6 +13,7 @@ from ase.calculators.calculator import Calculator, all_changes, compare_atoms
 from ase.filters import FrechetCellFilter
 from ase.optimize import BFGSLineSearch
 
+from lemat_genbench.batched.memory import MemoryBudget, memory_error
 from lemat_genbench.batched.types import BatchedModel, Prediction, RelaxOutcome
 
 
@@ -26,6 +27,7 @@ class _State:
     outcome: RelaxOutcome | BaseException | None = None
     model_calls: int = 0
     cache_hits: int = 0
+    memory_error_reported: bool = False
     stopped: bool = False
     thread: Thread | None = None
 
@@ -103,24 +105,50 @@ def _without_tracebacks(exc):
     return exc
 
 
-def _evaluate(model, geometries):
+def _evaluate(model, geometries, memory=None):
     """Bisect failed calls until each request has a prediction or exception."""
-    try:
-        predictions = model.predict([atoms.copy() for atoms in geometries])
-        if len(predictions) != len(geometries):
-            raise ValueError("Model must return one prediction per structure")
-        return predictions
-    except Exception as exc:
-        error = _without_tracebacks(exc)
-    # Release the failed forward's frames before freeing CUDA memory or retrying.
-    if isinstance(error, torch.OutOfMemoryError) and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if len(geometries) == 1:
-        return [error]
-    midpoint = len(geometries) // 2
-    return _evaluate(model, geometries[:midpoint]) + _evaluate(
-        model, geometries[midpoint:]
-    )
+    largest_success = 0
+    ran_out = False
+
+    def evaluate(batch):
+        nonlocal largest_success, ran_out
+        try:
+            predictions = model.predict([atoms.copy() for atoms in batch])
+            if len(predictions) != len(batch):
+                raise ValueError("Model must return one prediction per structure")
+            largest_success = max(largest_success, sum(map(len, batch)))
+            return predictions
+        except Exception as exc:
+            error = _without_tracebacks(exc)
+        # Release the failed forward's frames before freeing CUDA memory or retrying.
+        if memory_error(error):
+            ran_out = True
+            if memory is not None:
+                memory.record_error(error)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        if len(batch) == 1:
+            return [error]
+        midpoint = len(batch) // 2
+        return evaluate(batch[:midpoint]) + evaluate(batch[midpoint:])
+
+    predictions = []
+    offset = 0
+    while offset < len(geometries):
+        end, atoms = offset, 0
+        limit = memory.max_atoms if memory is not None else None
+        while end < len(geometries):
+            count = len(geometries[end])
+            if end > offset and limit is not None and atoms + count > limit:
+                break
+            atoms += count
+            end += 1
+        largest_success, ran_out = 0, False
+        predictions.extend(evaluate(geometries[offset:end]))
+        if ran_out and memory is not None:
+            memory.lower(largest_success)
+        offset = end
+    return predictions
 
 
 def relax_stream(
@@ -133,6 +161,7 @@ def relax_stream(
     max_atoms: int | None = None,
     geometry_tol: float | None = None,
     max_requests: int = 1000,
+    memory: MemoryBudget | None = None,
 ) -> Iterator[RelaxOutcome]:
     """Yield completed ASE relaxations with FIFO refill; cache hits count toward max_requests.
 
@@ -156,11 +185,14 @@ def relax_stream(
     next_job = None
     exhausted = False
     in_flight_atoms = 0
+    if memory is None:
+        memory = MemoryBudget(max_atoms)
 
     def relax(state):
         dyn = None
         endpoint = energy = error = fatal = None
         converged = False
+        is_memory_error = False
         nsteps = 0
         try:
             atoms = state.atoms
@@ -175,6 +207,7 @@ def relax_stream(
             endpoint = energy = None
             converged = False
             error = str(exc)
+            is_memory_error = memory_error(exc)
             nsteps = dyn.get_number_of_steps() if dyn is not None else 0
         except BaseException as exc:
             # Transport interrupts to the iterator's thread instead of losing them.
@@ -193,6 +226,7 @@ def relax_stream(
                         error,
                         state.model_calls,
                         state.cache_hits,
+                        is_memory_error,
                     )
                 )
                 finished.append(state)
@@ -211,6 +245,14 @@ def relax_stream(
             if outcome is not None:
                 if isinstance(outcome, BaseException):
                     raise outcome
+                if (
+                    outcome.memory_error
+                    and not state.memory_error_reported
+                    and memory.on_error is not None
+                ):
+                    # Errors outside predict() were not counted by _evaluate.
+                    # Notify from the iterator thread, which owns the worker pipe.
+                    memory.on_error(outcome.error)
                 yield outcome
                 continue
 
@@ -222,6 +264,7 @@ def relax_stream(
                         exhausted = True
                         break
                 index, atoms = next_job
+                max_atoms = memory.max_atoms
                 if (
                     max_atoms is not None
                     and active
@@ -248,10 +291,13 @@ def relax_stream(
                 for state, _ in batch:
                     state.request = None
 
-            replies = _evaluate(model, [atoms for _, atoms in batch])
+            replies = _evaluate(model, [atoms for _, atoms in batch], memory)
             with condition:
                 for (state, _), reply in zip(batch, replies):
                     state.model_calls += not isinstance(reply, Exception)
+                    state.memory_error_reported = isinstance(
+                        reply, Exception
+                    ) and memory_error(reply)
                     state.reply = reply
                     state.wake.notify()
     finally:

@@ -117,8 +117,8 @@ def _get_or_create_calculator(mlip_name: str, mlip_config: Dict[str, Any]):
 
 _BATCHED_DEFAULTS = {
     "workers_per_model": 8,
-    "structures_per_worker": 32,
-    "max_atoms_per_worker": None,
+    "structures_per_worker": 16,
+    "max_atoms_per_worker": "auto",
     "geometry_tolerance": None,
     "uma_fixes": True,
     "max_requests": 1000,
@@ -150,7 +150,7 @@ def _validate_execution_settings(execution_mode, matmul_precision, batched):
         "max_atoms_per_worker",
     ):
         value = batched[key]
-        if key == "max_atoms_per_worker" and value is None:
+        if key == "max_atoms_per_worker" and (value is None or value == "auto"):
             continue
         if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
             raise ValueError(f"{key} must be a positive integer")

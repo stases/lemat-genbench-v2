@@ -93,9 +93,12 @@ preprocessor_config:
   execution_mode: per_structure  # or batched: one model at a time, model calls batched
   matmul_precision: highest  # TF32 off; high reproduces the earlier TF32 behaviour
   batched:  # used only in batched mode
-    workers_per_model: 8  # worker processes per model, sharing one GPU
-    structures_per_worker: 32  # single-point batch size and relaxations in flight
-    max_atoms_per_worker: null  # optional atom budget; a larger structure runs alone
+    # Workers share free GPU memory after a reserve; fewer workers run if needed.
+    # Memory failures retry once in a final worker with the whole GPU; losses warn.
+    workers_per_model: 8  # maximum worker processes per model
+    structures_per_worker: 16  # single-point batch size and relaxations in flight
+    # auto uses the memory share; an integer sets the initial budget, null starts without one.
+    max_atoms_per_worker: auto  # a larger structure runs alone
     geometry_tolerance: null  # reuse an evaluation within this tolerance (Å); needs highest
     uma_fixes: true  # faster UMA batching; false keeps fairchem's code
     max_requests: 1000  # model requests per relaxation before it is recorded as failed

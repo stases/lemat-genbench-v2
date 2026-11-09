@@ -7,6 +7,12 @@ instead of raising (models/mace/calculator.py), UMA's clears ``atoms.info`` befo
 (models/uma/calculator.py) and fairchem's calculator writes charge and spin defaults into the
 atoms it evaluates, and loading a model switches TF32 on, as ORB's loader does. The batched
 workers are forked in this test so that the patches reach them.
+
+GPU memory is emulated: ``stage._device_memory`` reports a configurable free and total memory and
+``stage._limit_memory`` only records the share a worker gets. A worker held to a share raises the
+memory errors seen on real cards (PyTorch out-of-memory, a cuSOLVER handle failure, a cuBLAS
+allocation failure) for marked structures and for calls above an atom limit; a worker without a
+share does not, unless the fault is marked as permanent.
 """
 
 import multiprocessing
@@ -73,6 +79,80 @@ CUDA_ERROR = "CUDA error: an illegal memory access was encountered"
 CUDA_BROKEN = {"on": False}  # per process, like a CUDA context after such an error
 BATCH_LOG = {"path": None}
 TIME_LIMIT = 300  # seconds per test
+GIB = 2**30
+# device: (free, total) bytes reported to the first worker, or None for no GPU.
+# faults: atom count of a structure -> memory error raised by a worker held to a share for any
+#   call containing it ("oom", "cusolver", "cublas"), or by every worker ("always").
+# atom_limit: a worker held to a share raises out-of-memory for calls above this many atoms.
+# load_failures: per model, the first n workers run out of memory while loading the model.
+MEMORY_DEFAULTS = {
+    "device": None,
+    "faults": {},
+    "atom_limit": None,
+    "load_failures": 0,
+    "dir": None,
+}
+MEMORY = dict(MEMORY_DEFAULTS)
+MEMORY_ERRORS = {
+    "oom": lambda: torch.OutOfMemoryError(
+        "CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity "
+        "of 47.38 GiB of which 4.00 MiB is free."
+    ),
+    "cusolver": lambda: RuntimeError(
+        "cusolver error: CUSOLVER_STATUS_INTERNAL_ERROR, when calling "
+        "`cusolverDnCreate(handle)`"
+    ),
+    "cublas": lambda: RuntimeError(
+        "CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`"
+    ),
+}
+
+
+def in_worker():
+    return multiprocessing.parent_process() is not None
+
+
+def memory_fault(mlip, counts):
+    """Raise the memory error a worker would hit for a call on structures of these sizes."""
+    if not in_worker():
+        return
+    capped = stage.MEMORY_FRACTION is not None
+    event = "ok"
+    for count in counts:
+        kind = MEMORY["faults"].get(count)
+        if kind == "always" or (kind is not None and capped):
+            event = kind
+            break
+    else:
+        limit = MEMORY["atom_limit"]
+        if capped and limit is not None and sum(counts) > limit:
+            event = "atom_limit"
+    if MEMORY["dir"] is not None:
+        with open(MEMORY["dir"] / "calls.txt", "a") as log:
+            sizes = " ".join(map(str, counts))
+            log.write(f"{os.getpid()} {mlip} {int(capped)} {sizes} {event}\n")
+    if event in ("atom_limit", "always"):
+        raise MEMORY_ERRORS["oom"]()
+    if event != "ok":
+        raise MEMORY_ERRORS[event]()
+
+
+def memory_calls():
+    path = MEMORY["dir"] / "calls.txt"
+    calls = []
+    for line in path.read_text().splitlines() if path.exists() else []:
+        pid, mlip, capped, *counts, event = line.split()
+        calls.append((int(pid), mlip, capped == "1", list(map(int, counts)), event))
+    return calls
+
+
+def recorded_limits():
+    path = MEMORY["dir"] / "limits.txt"
+    limits = []
+    for line in path.read_text().splitlines() if path.exists() else []:
+        pid, fraction = line.split()
+        limits.append((int(pid), None if fraction == "None" else float(fraction)))
+    return limits
 
 
 def evaluate(name, atoms):
@@ -129,6 +209,14 @@ class FakeCalculator(BaseMLIPCalculator):
         super().__init__(**kwargs)
 
     def _setup_model(self, **kwargs):
+        if in_worker():
+            for i in range(MEMORY["load_failures"]):
+                token = MEMORY["dir"] / f"load_{self.mlip}_{i}"
+                try:
+                    os.close(os.open(token, os.O_CREAT | os.O_EXCL))
+                except FileExistsError:
+                    continue
+                raise MEMORY_ERRORS["oom"]()
         torch.set_float32_matmul_precision("high")  # as ORB's loader does
         self.ase_calc = FakeASECalculator(self.mlip)
 
@@ -141,6 +229,7 @@ class FakeCalculator(BaseMLIPCalculator):
             atoms.info = {}
         atoms.calc = self.ase_calc
         try:
+            memory_fault(self.mlip, [len(atoms)])
             energy = atoms.get_potential_energy()
             forces = atoms.get_forces()
         except Exception:
@@ -173,6 +262,7 @@ class FakeCalculator(BaseMLIPCalculator):
             os._exit(3)
         if CUDA_BROKEN["on"]:
             raise RuntimeError(CUDA_ERROR)
+        memory_fault(self.mlip, [len(structure)])
         element = EMBEDDING_FAULT.get(self.mlip)
         if element in {el.symbol for el in structure.composition.elements}:
             raise RuntimeError(f"fake {self.mlip} cannot embed {element}")
@@ -208,6 +298,7 @@ class FakeBatchedModel:
                 if CRASH["kind"] == "exit":
                     os._exit(3)
                 CUDA_BROKEN["on"] = True
+        memory_fault(self.mlip, [len(a) for a in atoms])
         return [Prediction(*evaluate(self.mlip, a)) for a in atoms]
 
 
@@ -298,6 +389,15 @@ def fakes(monkeypatch):
         lambda hull_type="dft", threshold=0.001: tables[hull_type][1],
     )
     monkeypatch.setattr(stage, "START_METHOD", "fork")
+    monkeypatch.setattr(stage, "_device_memory", lambda device: MEMORY["device"])
+
+    def limit_memory(device, fraction):
+        if MEMORY["dir"] is not None:
+            with open(MEMORY["dir"] / "limits.txt", "a") as log:
+                log.write(f"{os.getpid()} {fraction}\n")
+
+    monkeypatch.setattr(stage, "_limit_memory", limit_memory)
+    MEMORY.update(MEMORY_DEFAULTS, faults={})
     multi_mlip_preprocess._PROCESS_MODEL_CACHE.clear()
     precision = torch.get_float32_matmul_precision()
 
@@ -317,6 +417,7 @@ def fakes(monkeypatch):
         CRASH.update(flag=None, persistent=False, kind="exit", sighting=2)
         BATCH_LOG["path"] = None
         CUDA_BROKEN["on"] = False
+        MEMORY.update(MEMORY_DEFAULTS, faults={})
         multi_mlip_preprocess._PROCESS_MODEL_CACHE.clear()
         torch.set_float32_matmul_precision(precision)
 
@@ -510,8 +611,8 @@ def test_defaults():
     assert config.matmul_precision == "highest"
     assert config.batched == {
         "workers_per_model": 8,
-        "structures_per_worker": 32,
-        "max_atoms_per_worker": None,
+        "structures_per_worker": 16,
+        "max_atoms_per_worker": "auto",
         "geometry_tolerance": None,
         "uma_fixes": True,
         "max_requests": 1000,
@@ -527,6 +628,7 @@ def test_defaults():
         ({"batched": {"workers_per_model": 0}}, "workers_per_model"),
         ({"batched": {"structures_per_worker": 1.5}}, "structures_per_worker"),
         ({"batched": {"max_atoms_per_worker": 0}}, "max_atoms_per_worker"),
+        ({"batched": {"max_atoms_per_worker": "big"}}, "max_atoms_per_worker"),
         ({"batched": {"max_requests": True}}, "max_requests"),
         ({"batched": {"geometry_tolerance": -1.0}}, "geometry_tolerance"),
         ({"batched": {"uma_fixes": "yes"}}, "uma_fixes"),
@@ -543,3 +645,126 @@ def test_defaults():
 def test_invalid_settings_are_rejected(kwargs, match):
     with pytest.raises(ValueError, match=match):
         MultiMLIPStabilityPreprocessor(**kwargs)
+
+
+def by_id(result):
+    return {s.properties["id"]: s for s in result.processed_structures}
+
+
+LOST = "lost after retrying with the whole GPU"
+FAULTS = ("oom", "cusolver", "cublas")
+
+
+def test_memory_errors_are_recovered(fakes, tmp_path):
+    """Every memory error in a worker held to its share is retried; no value is lost."""
+    structures = make_structures()
+    reference = run(deepcopy(structures), "per_structure")
+    # 12 atoms: structure 14; 8 atoms: structure 9; 2 atoms: structures 2 and 4.
+    MEMORY.update(
+        device=(40 * GIB, 48 * GIB),
+        faults={12: "oom", 8: "cusolver", 2: "cublas"},
+        atom_limit=8,
+        dir=tmp_path,
+    )
+    result = run(deepcopy(structures), "batched")
+    assert_same_results(reference, result)
+    assert not any(LOST in warning for warning in result.warnings)
+    calls = memory_calls()
+    for name in MLIPS:
+        mine = [c for c in calls if c[1] == name]
+        # The faults fired in workers held to a share; the structures then ran without one.
+        fired = {
+            n for _, _, capped, ns, ev in mine if capped and ev in FAULTS for n in ns
+        }
+        assert {12, 8, 2} <= fired, (name, fired)
+        free = {
+            n for _, _, capped, ns, ev in mine if not capped and ev == "ok" for n in ns
+        }
+        assert {12, 8, 2} <= free, (name, free)
+        # After running out of memory a worker stops sending calls that are too large.
+        for pid in {c[0] for c in mine}:
+            over = [c for c in mine if c[0] == pid and c[4] == "atom_limit"]
+            assert len(over) <= 3, (name, pid, len(over))
+    assert multiprocessing.active_children() == []
+
+
+def test_lost_values_are_reported(fakes, tmp_path):
+    """A structure that runs out of memory even with the whole GPU is reported."""
+    structures = make_structures()
+    reference = run(deepcopy(structures), "per_structure")
+    MEMORY.update(device=(40 * GIB, 48 * GIB), faults={12: "always"}, dir=tmp_path)
+    result = run(deepcopy(structures), "batched")
+    lost = [warning for warning in result.warnings if LOST in warning]
+    for name in MLIPS:
+        assert any(w.startswith(f"[{name}] structure 14:") for w in lost), (name, lost)
+    assert all(w.split(":")[0].endswith("structure 14") for w in lost), lost
+    got = by_id(result)
+    for ref in reference.processed_structures:
+        i = ref.properties["id"]
+        if i != 14:
+            assert_same(ref, got[i], f"structure {i}")
+
+
+def test_workers_that_cannot_load_the_model_are_dropped(fakes, tmp_path):
+    structures = make_structures()
+    reference = run(deepcopy(structures), "per_structure")
+    MEMORY.update(device=(40 * GIB, 48 * GIB), load_failures=2, dir=tmp_path)
+    result = run(deepcopy(structures), "batched", workers_per_model=3)
+    assert_same_results(reference, result)
+
+
+def test_one_worker_without_a_share_when_none_can_load(fakes, tmp_path):
+    structures = make_structures()
+    reference = run(deepcopy(structures), "per_structure")
+    MEMORY.update(device=(40 * GIB, 48 * GIB), load_failures=2, dir=tmp_path)
+    result = run(deepcopy(structures), "batched", workers_per_model=2)
+    assert_same_results(reference, result)
+    assert any(fraction is None for _, fraction in recorded_limits())
+
+
+def test_model_that_never_loads_fails_the_run(fakes, tmp_path):
+    MEMORY.update(device=(40 * GIB, 48 * GIB), load_failures=3, dir=tmp_path)
+    with pytest.raises(RuntimeError, match="orb"):
+        run(make_structures(), "batched", workers_per_model=2)
+    assert multiprocessing.active_children() == []
+
+
+def test_memory_share_and_atom_budget(fakes, tmp_path, monkeypatch):
+    """Workers, share and atom budget follow from the free memory and the model constants."""
+    per_atom = 100 * 2**20
+    monkeypatch.setattr(stage, "MEMORY_MODEL", {name: (0, per_atom) for name in MLIPS})
+    monkeypatch.setattr(stage, "MIN_ATOM_BUDGET", 12)
+    free, total = 13 * GIB, 20 * GIB
+    MEMORY.update(device=(free, total), dir=tmp_path)
+    structures = make_structures()
+    reference = run(deepcopy(structures), "per_structure")
+    result = run(
+        deepcopy(structures),
+        "batched",
+        workers_per_model=8,
+        max_atoms_per_worker="auto",
+    )
+    assert_same_results(reference, result)
+
+    reserve = max(stage.MEMORY_RESERVE_MIN, stage.MEMORY_RESERVE_FRACTION * total)
+
+    def budget(workers):
+        share = (free - reserve) / workers - stage.CUDA_CONTEXT_BYTES
+        return share, int(share // (stage.ATOM_MARGIN * per_atom))
+
+    workers = 8
+    while budget(workers)[1] < 12:
+        workers -= 1
+    share, atoms = budget(workers)
+    assert (workers, atoms) == (6, 12)
+    # Single points that fail in a capped worker are retried by at most one final
+    # worker per model, without a share and without an atom budget.
+    limits = [fraction for _, fraction in recorded_limits()]
+    capped = [fraction for fraction in limits if fraction is not None]
+    assert capped and all(f == pytest.approx(share / total) for f in capped), limits
+    assert limits.count(None) <= len(MLIPS), limits
+    capped_calls = [call for call in memory_calls() if call[2]]
+    assert max(sum(counts) for _, _, _, counts, _ in capped_calls) <= atoms
+    for name in MLIPS:
+        pids = {call[0] for call in capped_calls if call[1] == name}
+        assert 1 < len(pids) <= workers, (name, pids)
