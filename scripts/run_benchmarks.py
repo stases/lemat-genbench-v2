@@ -48,6 +48,11 @@ from lemat_genbench.benchmarks.sun_benchmark import (
     SUNBenchmark,  # Updated SUN benchmark
 )
 from lemat_genbench.benchmarks.uniqueness_benchmark import UniquenessBenchmark
+from lemat_genbench.preprocess.coverage import (
+    coverage_warnings,
+    mlip_coverage,
+    preprocessor_coverage,
+)
 from lemat_genbench.preprocess.distribution_preprocess import DistributionPreprocessor
 from lemat_genbench.preprocess.fingerprint_preprocess import FingerprintPreprocessor
 from lemat_genbench.preprocess.multi_mlip_preprocess import (
@@ -411,7 +416,8 @@ def run_validity_preprocessing_and_filtering(
     Returns
     -------
     tuple
-        (validity_benchmark_result, valid_structures, validity_filtering_metadata)
+        (validity_benchmark_result, valid_structures, validity_filtering_metadata,
+        validity_preprocessor_result)
     """
     # Log initial memory usage
     log_memory_usage("before validity processing", force_log=monitor_memory)
@@ -513,7 +519,28 @@ def run_validity_preprocessing_and_filtering(
     # Log final memory usage
     log_memory_usage("after validity filtering", force_log=monitor_memory)
 
-    return validity_benchmark_result, valid_structures, validity_filtering_metadata
+    return (
+        validity_benchmark_result,
+        valid_structures,
+        validity_filtering_metadata,
+        validity_preprocessor_result,
+    )
+
+
+def _check_preprocessor_output(name, result):
+    """Stop before benchmarking if a remaining preprocessor lost every input."""
+    if result.n_input_structures > 0 and not result.processed_structures:
+        reason = result.warnings[0] if result.warnings else "no warning provided"
+        raise RuntimeError(f"Preprocessor {name} returned zero structures: {reason}")
+
+
+def _log_coverage(coverage):
+    messages = coverage_warnings(coverage)
+    if messages:
+        for message in messages:
+            logger.warning(message)
+    else:
+        logger.info("Preprocessing coverage: no missing values or failures")
 
 
 def run_remaining_preprocessors(
@@ -552,6 +579,7 @@ def run_remaining_preprocessors(
             fingerprint_method=fingerprint_method
         )
         fingerprint_result = fingerprint_preprocessor(processed_structures)
+        _check_preprocessor_output("fingerprint", fingerprint_result)
         processed_structures = fingerprint_result.processed_structures
         preprocessor_results["fingerprint"] = fingerprint_result
         elapsed_time = time.time() - start_time
@@ -570,6 +598,7 @@ def run_remaining_preprocessors(
         start_time = time.time()
         dist_preprocessor = DistributionPreprocessor()
         dist_result = dist_preprocessor(processed_structures)
+        _check_preprocessor_output("distribution", dist_result)
         processed_structures = dist_result.processed_structures
         preprocessor_results["distribution"] = dist_result
         elapsed_time = time.time() - start_time
@@ -653,6 +682,7 @@ def run_remaining_preprocessors(
             f"🔥 Processing {len(processed_structures)} valid structures with MLIP models..."
         )
         mlip_result = mlip_preprocessor(processed_structures)
+        _check_preprocessor_output("multi_mlip", mlip_result)
         processed_structures = mlip_result.processed_structures
         preprocessor_results["multi_mlip"] = mlip_result
         elapsed_time = time.time() - start_time
@@ -823,6 +853,7 @@ def save_results(
     run_name: str,
     config_name: str,
     n_total_structures: int,
+    coverage: Dict[str, Any],
 ):
     """Save benchmark results to JSON file."""
     # Create results directory
@@ -851,6 +882,7 @@ def save_results(
             "validity_mandatory": True,  # Flag to indicate validity was mandatory
         },
         "validity_filtering": validity_filtering_metadata,
+        "coverage": coverage,
         "results": all_results,
     }
 
@@ -1018,11 +1050,15 @@ def main():
         log_memory_usage("after loading structures", force_log=args.monitor_memory)
 
         # Step 1: Run validity processing and filtering
-        validity_result, valid_structures, validity_filtering_metadata = (
-            run_validity_preprocessing_and_filtering(
-                structures, config, args.monitor_memory
-            )
+        (
+            validity_result,
+            valid_structures,
+            validity_filtering_metadata,
+            validity_preprocessor_result,
+        ) = run_validity_preprocessing_and_filtering(
+            structures, config, args.monitor_memory
         )
+        coverage = {"validity": preprocessor_coverage(validity_preprocessor_result)}
 
         # Check if we have valid structures to continue
         if len(valid_structures) == 0:
@@ -1031,6 +1067,7 @@ def main():
             )
 
             # Save results with empty remaining benchmarks
+            _log_coverage(coverage)
             results_file = save_results(
                 validity_result,
                 {},
@@ -1038,6 +1075,7 @@ def main():
                 args.name,
                 args.config,
                 n_total_structures,
+                coverage,
             )
 
             # Print summary
@@ -1068,6 +1106,19 @@ def main():
             args.monitor_memory,
             args.generate_embedding_plots,
         )
+        coverage["preprocessors"] = {
+            name: preprocessor_coverage(result)
+            for name, result in preprocessor_results.items()
+        }
+        if "multi_mlip" in preprocessor_results:
+            mlip_result = preprocessor_results["multi_mlip"]
+            coverage["multi_mlip"] = mlip_coverage(
+                mlip_result.processed_structures,
+                mlip_result.config.mlip_names,
+                relaxed=mlip_result.config.relax_structures,
+                embeddings=mlip_result.config.extract_embeddings,
+            )
+        _log_coverage(coverage)
 
         # Step 4: Run remaining benchmarks on valid structures only
         remaining_benchmark_results = run_remaining_benchmarks(
@@ -1082,6 +1133,7 @@ def main():
             args.name,
             args.config,
             n_total_structures,
+            coverage,
         )
 
         # Final cleanup

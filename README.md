@@ -349,6 +349,7 @@ Results are saved to `results/` directory:
     "n_structures": 100,
     "benchmark_families": ["validity", "distribution", "diversity", "..."]
   },
+  "coverage": { "..." },
   "results": {
     "validity": { "..." },
     "distribution": { "..." },
@@ -356,6 +357,10 @@ Results are saved to `results/` directory:
   }
 }
 ```
+
+`coverage` counts what preprocessing could not compute: structures each preprocessor dropped and, per MLIP, how
+many structures have each value (energy, E_hull, embedding, relaxation) and why the others are missing. Every gap
+is also logged as a warning.
 
 </details>
 

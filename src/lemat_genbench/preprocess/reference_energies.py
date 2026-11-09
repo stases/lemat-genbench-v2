@@ -12,6 +12,8 @@ from scipy import sparse
 from scipy.optimize import linprog
 from tqdm import tqdm
 
+from lemat_genbench.utils.logging import logger
+
 CURRENT_FOLDER = os.path.dirname(Path(__file__).resolve())
 _HULL_REFERENCE_ARRAYS = {}
 
@@ -123,7 +125,7 @@ def get_formation_energy_from_composition_energy(
         )
         return res
     except Exception as e:
-        print("Error in get_formation_energy_from_composition_energy: ", e)
+        logger.warning(f"Error in get_formation_energy_from_composition_energy: {e}")
         return None
 
 
@@ -194,7 +196,7 @@ def one_hot_encode_composition(elements):
             element_obj = Element(base_element)
             one_hot[int(element_obj.number)] = 1
         except ValueError as e:
-            print(f"Warning: Invalid element '{element}': {e}")
+            logger.warning(f"Warning: Invalid element '{element}': {e}")
             continue
     return one_hot
 
@@ -247,6 +249,9 @@ def _retrieve_df(hull_type="dft", threshold=0.001):
                 dataset["species_at_sites"] = dataset["species_at_sites"].apply(
                     lambda x: x.tolist() if hasattr(x, "tolist") else x
                 )
+            logger.info(
+                f"Loaded {hull_type} hull table from local file: {Path(local_hull_path).resolve()}"
+            )
             return dataset
 
         try:
@@ -262,9 +267,14 @@ def _retrieve_df(hull_type="dft", threshold=0.001):
                     dataset["species_at_sites"] = dataset["species_at_sites"].apply(
                         lambda x: x.tolist() if hasattr(x, "tolist") else x
                     )
+                logger.info(
+                    f"Loaded {hull_type} hull table from HF dataset LeMaterial/LeMat-Bulk-MLIP-Hull"
+                )
                 return dataset
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                f"Failed to load {hull_type} hull table from HF dataset; trying fallback download: {e}"
+            )
 
         # Fall back to file-based approach
         from huggingface_hub import hf_hub_download
@@ -284,6 +294,9 @@ def _retrieve_df(hull_type="dft", threshold=0.001):
             dataset["species_at_sites"] = dataset["species_at_sites"].apply(
                 lambda x: x.tolist() if hasattr(x, "tolist") else x
             )
+        logger.info(
+            f"Loaded {hull_type} hull table from fallback download: {Path(file_path).resolve()}"
+        )
         return dataset
     except Exception as e:
         raise RuntimeError(
@@ -356,7 +369,7 @@ def filter_df(df, matrix, composition):
         intersection_elements = df.loc[(matrix @ forbidden_elements) == 0]
 
         if intersection_elements.empty:
-            print(
+            logger.warning(
                 f"Warning: No reference structures found for composition {composition.formula}"
             )
 

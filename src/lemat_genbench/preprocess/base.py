@@ -209,8 +209,12 @@ class BasePreprocessor(ABC):
                 warnings_for_batch.append(
                     f"Failed to process structure at batch index {idx} (original may vary): {str(e)}"
                 )
+                logger.warning(
+                    f"Failed to process structure at batch index {idx} "
+                    f"for {preprocessor_class.__name__}: {e}"
+                )
                 logger.debug(
-                    f"Failed to process structure in batch for {preprocessor_class.name}",
+                    f"Failed to process structure in batch for {preprocessor_class.__name__}",
                     exc_info=True,
                 )
         return batch_results, failed_indices_in_batch, warnings_for_batch
