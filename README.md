@@ -172,6 +172,55 @@ uv run scripts/run_benchmarks.py --csv my_structures.csv --config comprehensive_
 
 > 💡 **Tip**: Use configuration `comprehensive_multi_mlip_hull` for results comparable to the [leaderboard](https://huggingface.co/spaces/LeMaterial/LeMat-GenBench).
 
+### Batched Multi-MLIP preprocessing
+
+The Multi-MLIP stage evaluates every structure with ORB, MACE and UMA. By default
+(`execution_mode: per_structure`) each worker process handles one structure at a
+time with all three models. The `batched` mode runs one model at a time on the GPU,
+with several worker processes that each evaluate many structures per model call.
+Relaxations follow the same protocol as before (ASE `BFGSLineSearch` with
+`FrechetCellFilter`, fmax 0.02 eV/Å, at most 50 steps): every structure keeps its
+own optimizer, only the model calls are batched, and a finished relaxation's slot is
+given to the next structure. Embeddings are still extracted one structure at a time.
+
+Batched mode divides the GPU's free memory equally between workers after reserving
+memory for CUDA and other processes. It reduces the worker count when needed, and
+`max_atoms_per_worker: auto` sizes each worker's atom budget from its share; a
+positive integer sets a fixed initial budget and `null` starts without one. On CPU,
+`auto` has no atom budget. Batches that run out of memory are split and the worker
+lowers its budget to a size that succeeded. Structures that still fail alone are
+retried by one final worker with the whole GPU, restarting relaxations from the input.
+Every value that is still missing after that, whatever the cause, is logged once as
+a warning and counted in the result's `coverage` block.
+
+Batched mode does not use `n_jobs` (`MLIP_PREPROCESSOR_N_JOBS` in the runner) or
+the per-structure `timeout`. Instead of a timeout, each relaxation is limited to
+`max_requests` model calls; reaching it is recorded as a failed relaxation, as a
+line-search failure is. A worker process that dies is replaced once and its
+unfinished structures are run again; a second death stops the run. `uma_fixes` replaces two slow parts of fairchem's UMA code
+for batches (the expert-mixing step and the graph construction) with equivalent
+faster versions; `false` keeps fairchem's code. `geometry_tolerance`, off by
+default, lets a relaxation reuse its previous evaluation for a geometry within that
+tolerance.
+
+Both modes set the float32 matmul precision after loading the models.
+`matmul_precision: highest` (the default) turns TF32 off; `high` reproduces the
+behaviour of earlier versions, where loading ORB switched TF32 on. To use batched
+mode, set these keys under `preprocessor_config`:
+
+```yaml
+preprocessor_config:
+  execution_mode: batched
+  matmul_precision: highest
+  batched:
+    workers_per_model: 8
+    structures_per_worker: 16
+    max_atoms_per_worker: auto
+    geometry_tolerance: null
+    uma_fixes: true
+    max_requests: 1000
+```
+
 ### Command Line Options
 
 | Option | Description |
@@ -301,6 +350,7 @@ Results are saved to `results/` directory:
     "n_structures": 100,
     "benchmark_families": ["validity", "distribution", "diversity", "..."]
   },
+  "coverage": { "..." },
   "results": {
     "validity": { "..." },
     "distribution": { "..." },
@@ -308,6 +358,10 @@ Results are saved to `results/` directory:
   }
 }
 ```
+
+`coverage` counts what preprocessing could not compute: structures each preprocessor dropped and, per MLIP, how
+many structures have each value (energy, E_hull, embedding, relaxation) and why the others are missing. Every gap
+is also logged as a warning.
 
 </details>
 

@@ -10,6 +10,7 @@ import gc
 import multiprocessing
 import warnings
 from dataclasses import dataclass, field
+from numbers import Integral, Real
 from typing import Any, Dict, List
 
 import numpy as np
@@ -17,7 +18,11 @@ import torch
 from func_timeout import FunctionTimedOut, func_timeout
 from pymatgen.core import Structure
 
-from lemat_genbench.preprocess.base import BasePreprocessor, PreprocessorConfig
+from lemat_genbench.preprocess.base import (
+    BasePreprocessor,
+    PreprocessorConfig,
+    PreprocessorResult,
+)
 from lemat_genbench.utils.logging import logger
 
 multiprocessing.set_start_method("spawn", force=True)
@@ -110,6 +115,59 @@ def _get_or_create_calculator(mlip_name: str, mlip_config: Dict[str, Any]):
     return cache[cache_key]
 
 
+_BATCHED_DEFAULTS = {
+    "workers_per_model": 8,
+    "structures_per_worker": 16,
+    "max_atoms_per_worker": "auto",
+    "geometry_tolerance": None,
+    "uma_fixes": True,
+    "max_requests": 1000,
+}
+
+
+def _merge_model_config(mlip_name, mlip_config):
+    """Apply the same model defaults for logging and both execution modes."""
+    defaults = {
+        "mace": {"model_type": "mp", "device": "cpu"},
+        "orb": {"model_type": "orb_v3_conservative_inf_omat", "device": "cpu"},
+        "uma": {"task": "omat", "device": "cpu"},
+    }
+    return {**defaults.get(mlip_name, {"device": "cpu"}), **mlip_config}
+
+
+def _validate_execution_settings(execution_mode, matmul_precision, batched):
+    if execution_mode not in ("per_structure", "batched"):
+        raise ValueError("execution_mode must be 'per_structure' or 'batched'")
+    if matmul_precision not in ("highest", "high", "medium"):
+        raise ValueError("matmul_precision must be 'highest', 'high' or 'medium'")
+    unknown = batched.keys() - _BATCHED_DEFAULTS.keys()
+    if unknown:
+        raise ValueError(f"Unknown batched keys: {', '.join(map(str, unknown))}")
+    for key in (
+        "workers_per_model",
+        "structures_per_worker",
+        "max_requests",
+        "max_atoms_per_worker",
+    ):
+        value = batched[key]
+        if key == "max_atoms_per_worker" and (value is None or value == "auto"):
+            continue
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+    tolerance = batched["geometry_tolerance"]
+    if tolerance is not None:
+        if (
+            isinstance(tolerance, bool)
+            or not isinstance(tolerance, Real)
+            or not tolerance > 0
+        ):
+            raise ValueError("geometry_tolerance must be None or a positive real")
+        if matmul_precision != "highest":
+            raise ValueError("geometry_tolerance requires matmul_precision='highest'")
+    if not isinstance(batched["uma_fixes"], bool):
+        raise ValueError("uma_fixes must be a bool")
+
+
 def _initialize_worker_models(
     mlip_names: List[str], mlip_configs: Dict[str, Dict[str, Any]]
 ):
@@ -118,23 +176,9 @@ def _initialize_worker_models(
 
     for mlip_name in mlip_names:
         try:
-            mlip_config = mlip_configs.get(mlip_name, {})
-
-            # Use specific default configurations for each MLIP
-            if mlip_name == "mace":
-                default_config = {"model_type": "mp", "device": "cpu"}
-            elif mlip_name == "orb":
-                default_config = {
-                    "model_type": "orb_v3_conservative_inf_omat",
-                    "device": "cpu",
-                }
-            elif mlip_name == "uma":
-                default_config = {"task": "omat", "device": "cpu"}
-            else:
-                default_config = {"device": "cpu"}
-
-            # Merge user config with defaults (user config takes precedence)
-            final_config = {**default_config, **mlip_config}
+            final_config = _merge_model_config(
+                mlip_name, mlip_configs.get(mlip_name, {})
+            )
 
             logger.info(f"Will load {mlip_name} with config: {final_config}")
 
@@ -165,7 +209,13 @@ class MultiMLIPStabilityPreprocessorConfig(PreprocessorConfig):
     extract_embeddings : bool
         Whether to extract embeddings
     timeout : int
-        Timeout per structure per MLIP (seconds)
+        Timeout per structure per MLIP (seconds) in per_structure mode
+    execution_mode : str
+        per_structure (default) or batched model passes
+    matmul_precision : str
+        Float32 matmul precision, enforced after loading models (default: highest)
+    batched : Dict[str, Any]
+        Worker, batch, geometry reuse and relaxation request settings
     """
 
     mlip_names: List[str] = field(default_factory=lambda: ["orb", "mace", "uma"])
@@ -178,6 +228,9 @@ class MultiMLIPStabilityPreprocessorConfig(PreprocessorConfig):
     calculate_energy_above_hull: bool = True
     extract_embeddings: bool = True
     timeout: int = 300
+    execution_mode: str = "per_structure"
+    matmul_precision: str = "highest"
+    batched: Dict[str, Any] = field(default_factory=lambda: dict(_BATCHED_DEFAULTS))
 
 
 class MultiMLIPStabilityPreprocessor(BasePreprocessor):
@@ -204,7 +257,13 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
     extract_embeddings : bool
         Whether to extract embeddings
     timeout : int
-        Timeout per structure per MLIP (seconds)
+        Timeout per structure per MLIP (seconds) in per_structure mode
+    execution_mode : str
+        per_structure (default) or batched model passes
+    matmul_precision : str
+        Float32 matmul precision, enforced after loading models (default: highest)
+    batched : Dict[str, Any]
+        Worker, batch, geometry reuse and relaxation request settings
     name : str, optional
         Custom name for the preprocessor
     description : str, optional
@@ -226,10 +285,21 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
         name: str = None,
         description: str = None,
         n_jobs: int = 4,  # Use 4 cores to balance speed and memory
+        *,
+        execution_mode: str = "per_structure",
+        matmul_precision: str = "highest",
+        batched: Dict[str, Any] = None,
     ):
+        batched = {**_BATCHED_DEFAULTS, **(batched if batched is not None else {})}
+        _validate_execution_settings(execution_mode, matmul_precision, batched)
+
         # Set defaults
         if mlip_names is None:
             mlip_names = ["orb", "mace", "uma"]
+        if execution_mode == "batched":
+            for mlip_name in mlip_names:
+                if mlip_name not in ("orb", "mace", "uma"):
+                    raise ValueError(f"Unknown batched MLIP: {mlip_name!r}")
         if mlip_configs is None:
             mlip_configs = {}
         if relaxation_config is None:
@@ -259,10 +329,20 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             calculate_energy_above_hull=calculate_energy_above_hull,
             extract_embeddings=extract_embeddings,
             timeout=timeout,
+            execution_mode=execution_mode,
+            matmul_precision=matmul_precision,
+            batched=batched,
         )
 
         # Configure models (will be loaded in each worker process)
         _initialize_worker_models(self.config.mlip_names, self.config.mlip_configs)
+
+    def run(self, structures: list[Structure]) -> PreprocessorResult:
+        if self.config.execution_mode == "batched":
+            from lemat_genbench.batched.stage import run_batched_stage
+
+            return run_batched_stage(structures, self.config)
+        return super().run(structures)
 
     def _get_process_attributes(self) -> Dict[str, Any]:
         """Get the attributes for the process_structure method."""
@@ -275,6 +355,7 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             "calculate_formation_energy": self.config.calculate_formation_energy,
             "calculate_energy_above_hull": self.config.calculate_energy_above_hull,
             "extract_embeddings": self.config.extract_embeddings,
+            "matmul_precision": self.config.matmul_precision,
         }
 
     @staticmethod
@@ -288,6 +369,7 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
         calculate_formation_energy: bool,
         calculate_energy_above_hull: bool,
         extract_embeddings: bool,
+        matmul_precision: str = "highest",
     ) -> Structure:
         """Process a single structure using multiple MLIPs.
 
@@ -311,6 +393,8 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             Whether to calculate energy above hull
         extract_embeddings : bool
             Whether to extract embeddings
+        matmul_precision : str
+            Float32 matmul precision to restore after obtaining all calculators
 
         Returns
         -------
@@ -322,23 +406,9 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             calculators = {}
             for mlip_name in mlip_names:
                 try:
-                    mlip_config = mlip_configs.get(mlip_name, {})
-
-                    # Use specific default configurations for each MLIP
-                    if mlip_name == "mace":
-                        default_config = {"model_type": "mp", "device": "cpu"}
-                    elif mlip_name == "orb":
-                        default_config = {
-                            "model_type": "orb_v3_conservative_inf_omat",
-                            "device": "cpu",
-                        }
-                    elif mlip_name == "uma":
-                        default_config = {"task": "omat", "device": "cpu"}
-                    else:
-                        default_config = {"device": "cpu"}
-
-                    # Merge user config with defaults (user config takes precedence)
-                    final_config = {**default_config, **mlip_config}
+                    final_config = _merge_model_config(
+                        mlip_name, mlip_configs.get(mlip_name, {})
+                    )
 
                     calculators[mlip_name] = _get_or_create_calculator(
                         mlip_name, final_config
@@ -349,25 +419,11 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
                     )
                     continue
 
+            # Model loaders (including ORB) may change this process-global setting.
+            torch.set_float32_matmul_precision(matmul_precision)
+
             # Storage for results from each MLIP
             mlip_results = {}
-
-            # Storage for scalar metrics for statistical analysis
-            scalar_metrics = {
-                "energy": [],
-                "formation_energy": [],
-                "e_above_hull": [],
-                "relaxation_energy": [],
-                "relaxation_rmse": [],
-                "relaxation_steps": [],
-                "relaxed_formation_energy": [],
-                "relaxed_e_above_hull": [],
-            }
-
-            # Storage for vector metrics (to be averaged)
-            vector_metrics = {
-                "forces": [],
-            }
 
             # Process with each MLIP
             for mlip_name, calculator in calculators.items():
@@ -392,18 +448,6 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
 
                     mlip_results[mlip_name] = mlip_result
 
-                    # Collect scalar metrics for statistics
-                    for metric_name in scalar_metrics.keys():
-                        if (
-                            metric_name in mlip_result
-                            and mlip_result[metric_name] is not None
-                        ):
-                            scalar_metrics[metric_name].append(mlip_result[metric_name])
-
-                    # Collect vector metrics for averaging
-                    if "forces" in mlip_result and mlip_result["forces"] is not None:
-                        vector_metrics["forces"].append(mlip_result["forces"])
-
                 except FunctionTimedOut:
                     logger.warning(
                         f"Timeout processing {structure.formula} with {mlip_name}"
@@ -415,16 +459,7 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
                     )
                     mlip_results[mlip_name] = {"error": str(e)}
 
-            # Store individual MLIP results
-            for mlip_name, result in mlip_results.items():
-                if "error" not in result:
-                    _store_mlip_properties(structure, mlip_name, result)
-
-            # Calculate and store ensemble statistics
-            _calculate_ensemble_statistics(structure, scalar_metrics, vector_metrics)
-
-            # Create a clean copy of the structure before returning (for multiprocessing serialization)
-            clean_structure = _create_clean_structure_copy(structure)
+            clean_structure = _merge_mlip_results(structure, mlip_results)
 
             # Clear memory in worker process
             _clear_worker_memory()
@@ -434,6 +469,35 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
         except Exception as e:
             logger.error(f"Failed to process structure {structure.formula}: {str(e)}")
             raise
+
+
+def _merge_mlip_results(
+    structure: Structure, mlip_results: Dict[str, Any]
+) -> Structure:
+    """Store model properties and ensemble statistics in model insertion order."""
+    scalar_metrics = {
+        "energy": [],
+        "formation_energy": [],
+        "e_above_hull": [],
+        "relaxation_energy": [],
+        "relaxation_rmse": [],
+        "relaxation_steps": [],
+        "relaxed_formation_energy": [],
+        "relaxed_e_above_hull": [],
+    }
+    vector_metrics = {"forces": []}
+    for mlip_name, result in mlip_results.items():
+        if "error" in result:
+            structure.properties[f"mlip_error_{mlip_name}"] = result["error"]
+            continue
+        for metric_name in scalar_metrics:
+            if metric_name in result and result[metric_name] is not None:
+                scalar_metrics[metric_name].append(result[metric_name])
+        if result.get("forces") is not None:
+            vector_metrics["forces"].append(result["forces"])
+        _store_mlip_properties(structure, mlip_name, result)
+    _calculate_ensemble_statistics(structure, scalar_metrics, vector_metrics)
+    return _create_clean_structure_copy(structure)
 
 
 def _process_single_mlip(

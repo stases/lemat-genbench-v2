@@ -32,6 +32,7 @@ from lemat_genbench.utils.distribution_utils import (
     compute_mmd,
     load_reference_stats_cache,
 )
+from lemat_genbench.utils.logging import logger
 
 
 @dataclass
@@ -453,6 +454,7 @@ class FrechetDistance(BaseMetric):
             # Skip if no embeddings found
             if not all_properties or all(emb is None or (hasattr(emb, '__len__') and len(emb) == 0) for emb in all_properties):
                 warnings.append(f"No embeddings found for model {mlip}")
+                logger.warning(warnings[-1])
                 continue
             
             try:
@@ -467,10 +469,12 @@ class FrechetDistance(BaseMetric):
                     distances.append(frechetdist)
                 else:
                     warnings.append(f"No cached statistics found for model {mlip}")
+                    logger.warning(warnings[-1])
                     continue
                 
             except Exception as e:
                 warnings.append(f"Failed to compute Fréchet distance for {mlip}: {str(e)}")
+                logger.warning(warnings[-1])
                 continue
 
         if not distances:

@@ -7,12 +7,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from datasets import load_dataset
-from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
 from pymatgen.core import Composition, Element
 from scipy import sparse
+from scipy.optimize import linprog
 from tqdm import tqdm
 
+from lemat_genbench.utils.logging import logger
+
 CURRENT_FOLDER = os.path.dirname(Path(__file__).resolve())
+_HULL_REFERENCE_ARRAYS = {}
 
 
 def build_formation_energy_reference_file():
@@ -122,7 +125,7 @@ def get_formation_energy_from_composition_energy(
         )
         return res
     except Exception as e:
-        print("Error in get_formation_energy_from_composition_energy: ", e)
+        logger.warning(f"Error in get_formation_energy_from_composition_energy: {e}")
         return None
 
 
@@ -193,7 +196,7 @@ def one_hot_encode_composition(elements):
             element_obj = Element(base_element)
             one_hot[int(element_obj.number)] = 1
         except ValueError as e:
-            print(f"Warning: Invalid element '{element}': {e}")
+            logger.warning(f"Warning: Invalid element '{element}': {e}")
             continue
     return one_hot
 
@@ -246,6 +249,9 @@ def _retrieve_df(hull_type="dft", threshold=0.001):
                 dataset["species_at_sites"] = dataset["species_at_sites"].apply(
                     lambda x: x.tolist() if hasattr(x, "tolist") else x
                 )
+            logger.info(
+                f"Loaded {hull_type} hull table from local file: {Path(local_hull_path).resolve()}"
+            )
             return dataset
 
         try:
@@ -261,9 +267,14 @@ def _retrieve_df(hull_type="dft", threshold=0.001):
                     dataset["species_at_sites"] = dataset["species_at_sites"].apply(
                         lambda x: x.tolist() if hasattr(x, "tolist") else x
                     )
+                logger.info(
+                    f"Loaded {hull_type} hull table from HF dataset LeMaterial/LeMat-Bulk-MLIP-Hull"
+                )
                 return dataset
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                f"Failed to load {hull_type} hull table from HF dataset; trying fallback download: {e}"
+            )
 
         # Fall back to file-based approach
         from huggingface_hub import hf_hub_download
@@ -283,6 +294,9 @@ def _retrieve_df(hull_type="dft", threshold=0.001):
             dataset["species_at_sites"] = dataset["species_at_sites"].apply(
                 lambda x: x.tolist() if hasattr(x, "tolist") else x
             )
+        logger.info(
+            f"Loaded {hull_type} hull table from fallback download: {Path(file_path).resolve()}"
+        )
         return dataset
     except Exception as e:
         raise RuntimeError(
@@ -355,7 +369,7 @@ def filter_df(df, matrix, composition):
         intersection_elements = df.loc[(matrix @ forbidden_elements) == 0]
 
         if intersection_elements.empty:
-            print(
+            logger.warning(
                 f"Warning: No reference structures found for composition {composition.formula}"
             )
 
@@ -364,11 +378,64 @@ def filter_df(df, matrix, composition):
         raise ValueError(f"Failed to filter reference dataset: {e}") from e
 
 
+def hull_energy_per_atom(
+    reference_fractions, reference_energies_per_atom, target_fractions
+) -> float:
+    """Return the minimum mixture energy at the target atomic fractions, in eV/atom.
+
+    Reference fractions have shape (n_entries, n_elements), reference energies
+    have shape (n_entries,), and target fractions have shape (n_elements,).
+    Each composition is normalized to one atom. Raise ValueError if the linear
+    program has no optimal solution, including an infeasible target composition.
+    """
+    result = linprog(
+        reference_energies_per_atom,
+        A_eq=np.asarray(reference_fractions).T,
+        b_eq=target_fractions,
+        bounds=(0, None),
+        method="highs",
+        options={
+            "primal_feasibility_tolerance": 1e-10,
+            "dual_feasibility_tolerance": 1e-10,
+        },
+    )
+    if not result.success:
+        raise ValueError(f"Hull linear program failed: {result.message}")
+    return float(result.fun)
+
+
+def _hull_reference_arrays(df, hull_type, threshold):
+    """Cache fractions and eV/atom by table identity, in positional row order."""
+    key = (hull_type, threshold)
+    cached = _HULL_REFERENCE_ARRAYS.get(key)
+    if cached is not None and cached[0] is df:
+        return cached[1:]
+
+    # Sparse storage avoids a dense 119-column array for every full hull table.
+    indptr = [0]
+    atomic_numbers = []
+    fractions = []
+    num_atoms = []
+    for species in df["species_at_sites"]:
+        num_atoms.append(len(species))
+        for symbol, count in Counter(species).items():
+            atomic_numbers.append(Element(symbol).Z)
+            fractions.append(count / len(species))
+        indptr.append(len(atomic_numbers))
+
+    reference_fractions = sparse.csr_matrix(
+        (fractions, atomic_numbers, indptr), shape=(len(df), 119)
+    )
+    energies_per_atom = df["energy"].to_numpy(dtype=float) / np.asarray(num_atoms)
+    _HULL_REFERENCE_ARRAYS[key] = (df, reference_fractions, energies_per_atom)
+    return reference_fractions, energies_per_atom
+
+
 def get_energy_above_hull(total_energy, composition, hull_type="dft", threshold=0.001):
     """Calculate energy above hull from total energy and composition.
 
     This function properly handles charged species by converting them
-    to neutral elements before creating PDEntry objects.
+    to neutral elements before solving for the minimum reference mixture energy.
 
     Parameters
     ----------
@@ -389,34 +456,25 @@ def get_energy_above_hull(total_energy, composition, hull_type="dft", threshold=
 
     Notes
     -----
-    Pymatgen's get_decomp_and_e_above_hull() always returns eV/atom,
-    making this an intensive property like formation energy.
-    This follows Materials Project conventions.
+    The hull energy is computed with a linear program over reference atomic
+    fractions. The result is in eV/atom and may be negative, matching pymatgen's
+    get_decomp_and_e_above_hull() with allow_negative=True.
     """
 
     try:
+        reference_df = _retrieve_df(hull_type, threshold)
         intersection_elements = filter_df(
-            _retrieve_df(hull_type, threshold),
+            reference_df,
             _retrieve_matrix(hull_type, threshold),
             composition,
         )
 
-        # Create PDEntries from the filtered DataFrame
-        # using species_at_sites for composition because no ambiguity there
-        pd_entries = [
-            PDEntry(Composition(Counter(row["species_at_sites"])), row["energy"])
-            for _, row in intersection_elements.iterrows()
-        ]
-
-        if not pd_entries:
+        if intersection_elements.empty:
             raise ValueError(
                 f"No entries found in dataset containing any of the elements in: {composition.elements}"
             )
 
-        # Construct phase diagram
-        pd = PhaseDiagram(pd_entries)
-
-        # Convert charged species to neutral composition for PDEntry creation
+        # Convert charged species to a neutral composition for hull evaluation
         # This follows the same logic as get_formation_energy_from_composition_energy
         neutral_composition_dict = {}
         for element, count in composition.as_dict().items():
@@ -435,17 +493,37 @@ def get_energy_above_hull(total_energy, composition, hull_type="dft", threshold=
                 # For neutral elements
                 base_element = element
 
-            # Use neutral element for PDEntry creation
+            # Use the neutral element for hull evaluation
             if base_element not in neutral_composition_dict:
                 neutral_composition_dict[base_element] = 0
             neutral_composition_dict[base_element] += count
 
         neutral_composition = Composition(neutral_composition_dict)
 
-        entry = PDEntry(neutral_composition, total_energy)
-        e_above_hull = pd.get_decomp_and_e_above_hull(entry, allow_negative=True)[1]
+        reference_fractions, reference_energies = _hull_reference_arrays(
+            reference_df, hull_type, threshold
+        )
+        rows = reference_df.index.get_indexer(intersection_elements.index)
+        elements = neutral_composition.elements
+        fractions = reference_fractions[rows][:, [el.Z for el in elements]].toarray()
+        missing_elements = [
+            el.symbol
+            for el, present in zip(elements, (fractions == 1).any(axis=0))
+            if not present
+        ]
+        if missing_elements:
+            raise ValueError(
+                f"Missing terminal entries for elements {', '.join(missing_elements)}"
+            )
 
-        return e_above_hull
+        target_fractions = [
+            neutral_composition.get_atomic_fraction(el) for el in elements
+        ]
+        hull_energy = hull_energy_per_atom(
+            fractions, reference_energies[rows], target_fractions
+        )
+        # np.float64, as pymatgen returned, keeps float32 energies from rounding the result
+        return total_energy / neutral_composition.num_atoms - np.float64(hull_energy)
 
     except Exception as e:
         raise ValueError(
