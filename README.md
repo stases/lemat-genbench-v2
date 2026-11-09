@@ -190,7 +190,8 @@ positive integer sets a fixed initial budget and `null` starts without one. On C
 `auto` has no atom budget. Batches that run out of memory are split and the worker
 lowers its budget to a size that succeeded. Structures that still fail alone are
 retried by one final worker with the whole GPU, restarting relaxations from the input.
-Any remaining memory losses appear in warnings and the pass summary.
+Every value that is still missing after that, whatever the cause, is logged once as
+a warning and counted in the result's `coverage` block.
 
 Batched mode does not use `n_jobs` (`MLIP_PREPROCESSOR_N_JOBS` in the runner) or
 the per-structure `timeout`. Instead of a timeout, each relaxation is limited to
