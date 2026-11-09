@@ -283,8 +283,13 @@ material_id,structure,other_metadata
 |--------|-------------|-------|--------|
 | `bawl` | Full BAWL fingerprinting | Fast | Low |
 | `short-bawl` | Shortened BAWL fingerprinting (default) | Fast | Low |
-| `structure-matcher` | PyMatGen StructureMatcher comparison | Slow | High |
+| `structure-matcher` | PyMatGen StructureMatcher comparison | Medium | Medium |
 | `pdd` | Packing density descriptor | Medium | Medium |
+
+With `structure-matcher`, novelty, uniqueness and SUN compare a structure only with structures of the same reduced
+composition. StructureMatcher rejects every other pair before looking at the geometry, so the results are the same
+as comparing all pairs. On first use the novelty metric builds an index of the reference set (about 10 s once the
+dataset is cached) and saves it as `data/reference_index_*.npz` (about 230 MB) for later runs.
 
 ```bash
 # Use structure-matcher for better accuracy (slower)
@@ -480,9 +485,9 @@ uv run scripts/download_above_hull_datasets.py
 ```
 
 **5. Structure-Matcher Performance:**
-- Structure-matcher is more accurate but much slower than BAWL
-- Consider using for smaller datasets or when accuracy is critical
-- Use SSH-optimized script for large datasets
+- Structure-matcher novelty for 2,500 structures takes one to three minutes on 4 CPUs; uniqueness and SUN take
+  seconds
+- The first run builds the reference index (see Fingerprinting Methods); later runs load it
 
 ### Getting Help
 - Check the [scripts documentation](scripts/README_benchmark_runner.md)

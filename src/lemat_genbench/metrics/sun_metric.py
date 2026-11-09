@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from pymatgen.core.structure import Structure
 
+from lemat_genbench.fingerprinting.reference_index import CompositionGroups
 from lemat_genbench.metrics.base import BaseMetric, MetricConfig, MetricResult
 from lemat_genbench.metrics.novelty_metric import NoveltyMetric
 from lemat_genbench.metrics.uniqueness_metric import UniquenessMetric
@@ -387,11 +388,12 @@ class SUNMetric(BaseMetric):
         if "structure-matcher" in self.config.fingerprint_method.lower():
             fingerprinter = self.uniqueness_metric.fingerprinter
             unique_indices = []
+            groups = CompositionGroups(structures)
             
             for i, structure1 in enumerate(structures):
                 is_unique = True
                 # Check against all previous structures to avoid duplicating earlier ones
-                for j in range(i):
+                for j in groups.candidates(i, earlier=True):
                     structure2 = structures[j]
                     try:
                         is_equivalent = fingerprinter.is_equivalent(structure1, structure2)

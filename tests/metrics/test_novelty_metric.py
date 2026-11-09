@@ -7,7 +7,6 @@ import traceback
 from unittest.mock import Mock, patch
 
 import numpy as np
-import pandas as pd
 import pytest
 from pymatgen.core.structure import Structure
 
@@ -415,55 +414,28 @@ class TestNoveltyMetricBasic:
         expected_fps = {"fp1_compound1", "fp2_compound2", "fp3_compound3"}
         assert dataset_info["fingerprints"] == expected_fps
 
-    @patch("lemat_genbench.metrics.novelty_metric.load_dataset")
-    def test_load_reference_dataset_structure_matcher(self, mock_load_dataset):
-        """Test loading reference dataset for structure matcher method."""
-        # Mock dataset with proper column_names attribute - USE ACTUAL LIST
-        mock_dataset = Mock()
-        mock_dataset.column_names = ["immutable_id", "chemical_formula_descriptive", "other_column"]
-        
-        # Properly implement __len__ method that returns an integer directly
-        def mock_len(self):
-            return 100
-        mock_dataset.__len__ = mock_len
-        
-        # Mock the select method for dataset size limiting
-        mock_selected_dataset = Mock()
-        def mock_selected_len(self):
-            return 10  # Limited by max_reference_size
-        mock_selected_dataset.__len__ = mock_selected_len
-        
-        # IMPORTANT: Set column_names on selected dataset too for the second branch
-        mock_selected_dataset.column_names = ["immutable_id", "chemical_formula_descriptive", "other_column"]
-        
-        mock_dataset.select = Mock(return_value=mock_selected_dataset)
-        
-        # Mock the method chain: select_columns -> to_pandas -> set_index
-        mock_columns_result = Mock()
-        mock_pandas_result = Mock()
-        # Make the final result a real DataFrame that supports len() and indexing
-        mock_indexed_result = pd.DataFrame({
-            "chemical_formula_descriptive": ["NaCl", "KBr"],
-        }, index=["id1", "id2"])
-        
-        mock_selected_dataset.select_columns = Mock(return_value=mock_columns_result)
-        mock_columns_result.to_pandas = Mock(return_value=mock_pandas_result)
-        mock_pandas_result.set_index = Mock(return_value=mock_indexed_result)
-        
-        # Mock two separate calls to load_dataset since structure-matcher method loads twice
-        # The first call returns the selected dataset, the second call returns the full dataset
-        mock_load_dataset.side_effect = [mock_dataset, mock_dataset]
+    @patch("lemat_genbench.metrics.novelty_metric.get_reference_index")
+    def test_load_reference_dataset_structure_matcher(self, mock_get_index):
+        """Test loading and retaining the shared structure matcher index."""
+        metric = NoveltyMetric(
+            fingerprint_method="structure-matcher",
+            reference_dataset="custom/reference",
+            reference_config="custom_config",
+            max_reference_size=10,
+        )
+        dataset_info = metric._load_reference_dataset()
 
-        with patch("lemat_genbench.metrics.novelty_metric.get_all_compositions") as mock_get_comps:
-            mock_get_comps.return_value = {"Na": 1, "Cl": 1}
+        assert dataset_info == {"reference_index": mock_get_index.return_value}
+        mock_get_index.assert_called_once_with("custom/reference", "custom_config", 10)
+        assert metric._load_reference_dataset() is dataset_info
+        mock_get_index.assert_called_once()
 
-            metric = NoveltyMetric(fingerprint_method="structure-matcher", max_reference_size=10)
-            dataset_info = metric._load_reference_dataset()
-
-            # Should have dataset information for structure matcher
-            assert "dataset_dataframe" in dataset_info
-            assert "all_compositions" in dataset_info
-            assert "dataset" in dataset_info
+        uncached = NoveltyMetric(
+            fingerprint_method="structure-matcher", cache_reference=False
+        )
+        uncached._load_reference_dataset()
+        assert uncached._dataset_information is None
+        assert not uncached._reference_loaded
 
     def test_get_compute_attributes(self):
         """Test _get_compute_attributes method."""
@@ -605,110 +577,42 @@ class TestNoveltyMetricIntegration:
 class TestNoveltyMetricStructureMatcher:
     """Test novelty metric with structure matcher fingerprinting."""
 
-    @patch("lemat_genbench.metrics.novelty_metric.load_dataset")
-    @patch("lemat_genbench.metrics.novelty_metric.get_all_compositions")
-    @patch("lemat_genbench.metrics.novelty_metric.filter_df")
-    @patch("lemat_genbench.metrics.novelty_metric.lematbulk_item_to_structure")
-    def test_structure_matcher_novel(
-        self, mock_item_to_struct, mock_filter_df, mock_get_comps, mock_load_dataset
-    ):
-        """Test structure matcher with novel structure."""
-        # Set up mocks
-        mock_dataset = Mock()
-        mock_load_dataset.return_value = mock_dataset
-        mock_get_comps.return_value = {"Na": 1, "Cl": 1}
-        
-        # Mock filtering to return empty result (no similar compositions)
-        mock_filter_result = pd.DataFrame()  # Use real empty DataFrame instead of Mock
-        mock_filter_df.return_value = mock_filter_result
-
+    def test_structure_matcher_novel(self):
+        """Test structure matcher with no reference candidates."""
         structure = create_simple_test_structures()[0]
-
-        # Mock structure matcher that never finds equivalents
-        mock_fingerprinter = Mock()
-        mock_fingerprinter.is_equivalent = Mock(return_value=False)
-        # Important: structure matcher doesn't have get_material_hash
-        if hasattr(mock_fingerprinter, 'get_material_hash'):
-            delattr(mock_fingerprinter, 'get_material_hash')
-
-        # Create real pandas DataFrame with index_number column for proper pandas operations
-        mock_dataframe = pd.DataFrame({"index_number": []})  # Empty DataFrame
-        
-        # Mock dataset information for structure matcher
-        dataset_information = {
-            "dataset_dataframe": mock_dataframe,
-            "all_compositions": {"Na": 1, "Cl": 1},
-            "dataset": Mock()
-        }
-        
-        # Mock dataset selection to return empty list (no matches)
-        dataset_information["dataset"].select = Mock(return_value=[])
+        index = Mock(novelty_cache={})
+        index.candidates.return_value = []
+        fingerprinter = Mock(spec=["matcher", "is_equivalent"])
+        fingerprinter.matcher.as_dict.return_value = {"ltol": 0.1}
+        fingerprinter.is_equivalent.return_value = False
 
         result = NoveltyMetric.compute_structure(
-            structure, dataset_information, mock_fingerprinter, verbose=False
+            structure, {"reference_index": index}, fingerprinter, verbose=False
         )
 
-        # Should be novel since no equivalent structures found (empty iteration)
         assert result == 1.0
+        fingerprinter.is_equivalent.assert_not_called()
+        assert list(index.novelty_cache.values()) == [1.0]
 
-    @patch("lemat_genbench.metrics.novelty_metric.load_dataset")
-    @patch("lemat_genbench.metrics.novelty_metric.get_all_compositions")
-    @patch("lemat_genbench.metrics.novelty_metric.filter_df")
-    @patch("lemat_genbench.metrics.novelty_metric.lematbulk_item_to_structure")
-    def test_structure_matcher_known(
-        self, mock_item_to_struct, mock_filter_df, mock_get_comps, mock_load_dataset
-    ):
-        """Test structure matcher with known structure."""
-        # Set up mocks
-        mock_dataset = Mock()
-        mock_load_dataset.return_value = mock_dataset
-        mock_get_comps.return_value = {"Na": 1, "Cl": 1}
-        
-        # Mock filtering to return some matches
-        mock_df = Mock()
-        mock_df.index = [0]
-        mock_filter_df.return_value = mock_df
-
+    def test_structure_matcher_known(self):
+        """Test structure matcher with a matching reference candidate."""
         structure = create_simple_test_structures()[0]
-
-        # Mock reference structure
-        ref_structure = create_simple_test_structures()[0]  # Same structure
-        mock_item_to_struct.return_value = ref_structure
-
-        # Mock structure matcher that finds equivalents
-        mock_fingerprinter = Mock()
-        mock_fingerprinter.is_equivalent = Mock(return_value=True)
-        # Important: structure matcher doesn't have get_material_hash
-        if hasattr(mock_fingerprinter, 'get_material_hash'):
-            delattr(mock_fingerprinter, 'get_material_hash')
-
-        # Mock dataset information for structure matcher with proper chaining
-        mock_dataframe = Mock()
-        mock_loc = Mock()
-        mock_index_getitem = Mock()
-        mock_index_getitem.__getitem__ = Mock(return_value=[0])
-        mock_loc.__getitem__ = Mock(return_value=mock_index_getitem)
-        mock_dataframe.loc = mock_loc
-        
-        dataset_information = {
-            "dataset_dataframe": mock_dataframe,
-            "all_compositions": {"Na": 1, "Cl": 1},
-            "dataset": Mock()
-        }
-        
-        # Mock dataset selection
-        mock_dataset_select = [{"mock": "data"}]
-        dataset_information["dataset"].select.return_value = mock_dataset_select
+        ref_structure = create_simple_test_structures()[0]
+        index = Mock(novelty_cache={})
+        index.candidates.return_value = [0, 1]
+        index.structure.return_value = ref_structure
+        fingerprinter = Mock(spec=["matcher", "is_equivalent"])
+        fingerprinter.matcher.as_dict.return_value = {"ltol": 0.1}
+        fingerprinter.is_equivalent.return_value = True
 
         result = NoveltyMetric.compute_structure(
-            structure, dataset_information, mock_fingerprinter, verbose=False
+            structure, {"reference_index": index}, fingerprinter, verbose=False
         )
 
-        # Should be known since equivalent structure found
         assert result == 0.0
-
-        # Verify that structure matcher was called
-        mock_fingerprinter.is_equivalent.assert_called_once()
+        fingerprinter.is_equivalent.assert_called_once_with(structure, ref_structure)
+        index.structure.assert_called_once_with(0)
+        assert list(index.novelty_cache.values()) == [0.0]
 
 
 # Manual test function for development
