@@ -639,6 +639,13 @@ def run_remaining_preprocessors(
             extract_embeddings=extract_embeddings,
             timeout=300,
             n_jobs=mlip_n_jobs,
+            execution_mode=preprocessor_config_from_file.get(
+                "execution_mode", "per_structure"
+            ),
+            matmul_precision=preprocessor_config_from_file.get(
+                "matmul_precision", "highest"
+            ),
+            batched=preprocessor_config_from_file.get("batched", {}),
         )
 
         # Add progress bar for structure processing

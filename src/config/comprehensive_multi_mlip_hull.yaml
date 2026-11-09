@@ -90,6 +90,15 @@ preprocessor_config:
   calculate_energy_above_hull: true  # This will use hull-specific calculations
   extract_embeddings: true
   timeout: 300
+  execution_mode: per_structure  # or batched: one model at a time, model calls batched
+  matmul_precision: highest  # TF32 off; high reproduces the earlier TF32 behaviour
+  batched:  # used only in batched mode
+    workers_per_model: 8  # worker processes per model, sharing one GPU
+    structures_per_worker: 32  # single-point batch size and relaxations in flight
+    max_atoms_per_worker: null  # optional atom budget; a larger structure runs alone
+    geometry_tolerance: null  # reuse an evaluation within this tolerance (Å); needs highest
+    uma_fixes: true  # faster UMA batching; false keeps fairchem's code
+    max_requests: 1000  # model requests per relaxation before it is recorded as failed
 
 # Reporting configuration
 reporting:
