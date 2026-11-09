@@ -162,6 +162,8 @@ class MultiMLIPStabilityPreprocessorConfig(PreprocessorConfig):
         Whether to extract embeddings
     timeout : int
         Timeout per structure per MLIP (seconds)
+    matmul_precision : str
+        Float32 matmul precision, enforced after loading models (default: highest)
     """
 
     mlip_names: List[str] = field(default_factory=lambda: ["orb", "mace", "uma"])
@@ -174,6 +176,7 @@ class MultiMLIPStabilityPreprocessorConfig(PreprocessorConfig):
     calculate_energy_above_hull: bool = True
     extract_embeddings: bool = True
     timeout: int = 300
+    matmul_precision: str = "highest"
 
 
 class MultiMLIPStabilityPreprocessor(BasePreprocessor):
@@ -201,6 +204,8 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
         Whether to extract embeddings
     timeout : int
         Timeout per structure per MLIP (seconds)
+    matmul_precision : str
+        Float32 matmul precision, enforced after loading models (default: highest)
     name : str, optional
         Custom name for the preprocessor
     description : str, optional
@@ -222,7 +227,12 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
         name: str = None,
         description: str = None,
         n_jobs: int = 4,  # Use 4 cores to balance speed and memory
+        *,
+        matmul_precision: str = "highest",
     ):
+        if matmul_precision not in ("highest", "high", "medium"):
+            raise ValueError("matmul_precision must be 'highest', 'high' or 'medium'")
+
         # Set defaults
         if mlip_names is None:
             mlip_names = ["orb", "mace", "uma"]
@@ -255,6 +265,7 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             calculate_energy_above_hull=calculate_energy_above_hull,
             extract_embeddings=extract_embeddings,
             timeout=timeout,
+            matmul_precision=matmul_precision,
         )
 
         # Configure models (will be loaded in each worker process)
@@ -271,6 +282,7 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             "calculate_formation_energy": self.config.calculate_formation_energy,
             "calculate_energy_above_hull": self.config.calculate_energy_above_hull,
             "extract_embeddings": self.config.extract_embeddings,
+            "matmul_precision": self.config.matmul_precision,
         }
 
     @staticmethod
@@ -284,6 +296,7 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
         calculate_formation_energy: bool,
         calculate_energy_above_hull: bool,
         extract_embeddings: bool,
+        matmul_precision: str = "highest",
     ) -> Structure:
         """Process a single structure using multiple MLIPs.
 
@@ -307,6 +320,8 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             Whether to calculate energy above hull
         extract_embeddings : bool
             Whether to extract embeddings
+        matmul_precision : str
+            Float32 matmul precision to restore after obtaining all calculators
 
         Returns
         -------
@@ -330,6 +345,9 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
                         f"Failed to get calculator for {mlip_name}: {str(e)}"
                     )
                     continue
+
+            # Model loaders (including ORB) may change this process-global setting.
+            torch.set_float32_matmul_precision(matmul_precision)
 
             # Storage for results from each MLIP
             mlip_results = {}
