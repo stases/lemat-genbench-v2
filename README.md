@@ -23,6 +23,60 @@ A comprehensive benchmarking framework for evaluating material generation models
 
 ---
 
+## v2 prototype
+
+This branch (`v2`) combines changes intended for upstream pull requests: a batched execution mode for the
+Multi-MLIP stage, a faster convex hull, composition-indexed structure matching, and reporting of every value a run
+could not compute. It runs the same benchmark with the same protocols (models, hull tables, relaxation protocol,
+thresholds and matcher settings), about eight times faster on one GPU, and a run that loses values now says so.
+
+What changed:
+
+- Energy above hull is computed as a small linear program over the same reference entries instead of building a
+  pymatgen `PhaseDiagram` on every call. The values agree to 1e-13 eV/atom, and structures with ten or more
+  elements no longer run into the 300 s per-model timeout.
+- The Multi-MLIP stage has a batched mode (`execution_mode: batched`): one model at a time on the GPU, several
+  worker processes, many structures per model call. Every relaxation keeps its own ASE optimizer
+  (`BFGSLineSearch` with `FrechetCellFilter`, fmax 0.02 eV/Å, at most 50 steps); only the model calls are batched,
+  and a finished relaxation's slot goes to the next structure. On two full runs it gives the same stable,
+  metastable, SUN, MSUN, novelty and validity labels as per-structure mode, with energies within 6e-6 eV/atom.
+- In batched mode every worker gets an equal share of the free GPU memory, so the stage also works on a card that
+  other processes partly use. A batch that runs out of memory is split, and a structure that still fails is
+  retried by a final worker with the whole GPU instead of being lost.
+- TF32 is off by default in both modes (`matmul_precision: highest`). Loading ORB used to switch it on for all
+  three models, which made repeated runs differ by up to 1e-3 eV/atom; per-model values move within that noise.
+- Structure-matcher novelty, uniqueness and SUN compare only structures with the same reduced composition. The
+  results are identical on all 44 stored leaderboard runs; novelty is 16-22x faster and uniqueness and SUN several
+  hundred times faster.
+- The result JSON has a `coverage` block that counts every value preprocessing could not compute (see Output), and
+  every gap is logged as a warning.
+
+The settings live under `preprocessor_config` in the YAML config:
+
+| key | default | meaning |
+|---|---|---|
+| `execution_mode` | `per_structure` | `batched` runs the Multi-MLIP stage one model at a time with batched model calls |
+| `matmul_precision` | `highest` | TF32 off; `high` restores the earlier behaviour |
+| `batched.workers_per_model` | `8` | maximum worker processes per model on one GPU |
+| `batched.structures_per_worker` | `16` | single-point batch size and relaxations in flight per worker |
+| `batched.max_atoms_per_worker` | `auto` | atoms per model call; `auto` derives it from the worker's memory share |
+| `batched.geometry_tolerance` | `null` | reuse an evaluation for a geometry within this distance (Å); off by default |
+| `batched.uma_fixes` | `true` | equivalent, faster UMA code for batches; `false` keeps fairchem's |
+| `batched.max_requests` | `1000` | model calls per relaxation before it counts as failed (replaces the timeout) |
+
+The composition index and the coverage block have no setting; they are always used. To run in batched mode, copy
+`src/config/comprehensive_multi_mlip_hull.yaml`, set `execution_mode: batched`, and pass the copy with `--config`
+(details in [Batched Multi-MLIP preprocessing](#batched-multi-mlip-preprocessing)).
+
+Whole runs of the leaderboard configuration on 2,500 samples, one RTX 6000 Ada (48 GB):
+
+| samples | upstream main, per-structure | v2, batched |
+|---|---:|---:|
+| DiffCSP++ | 4 h 52 min | 38 min |
+| Orbitol | 3 h 24 min | 21 min |
+
+---
+
 ## 🚀 Quick Start
 
 ```bash
