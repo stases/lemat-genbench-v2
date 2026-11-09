@@ -186,6 +186,9 @@ data/*_embeddings.npy
 data/lematbulk_full_distribution_properties.pkl
 data/lematbulk_mmd_values.pkl 
 
+# Novelty reference index cache (built on first use)
+data/reference_index_*.npz
+
 # Local testing
 submissions/
 final_results/
