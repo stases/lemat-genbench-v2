@@ -110,6 +110,16 @@ def _get_or_create_calculator(mlip_name: str, mlip_config: Dict[str, Any]):
     return cache[cache_key]
 
 
+def _merge_model_config(mlip_name, mlip_config):
+    """Apply the same model defaults for logging and both execution modes."""
+    defaults = {
+        "mace": {"model_type": "mp", "device": "cpu"},
+        "orb": {"model_type": "orb_v3_conservative_inf_omat", "device": "cpu"},
+        "uma": {"task": "omat", "device": "cpu"},
+    }
+    return {**defaults.get(mlip_name, {"device": "cpu"}), **mlip_config}
+
+
 def _initialize_worker_models(
     mlip_names: List[str], mlip_configs: Dict[str, Dict[str, Any]]
 ):
@@ -118,23 +128,9 @@ def _initialize_worker_models(
 
     for mlip_name in mlip_names:
         try:
-            mlip_config = mlip_configs.get(mlip_name, {})
-
-            # Use specific default configurations for each MLIP
-            if mlip_name == "mace":
-                default_config = {"model_type": "mp", "device": "cpu"}
-            elif mlip_name == "orb":
-                default_config = {
-                    "model_type": "orb_v3_conservative_inf_omat",
-                    "device": "cpu",
-                }
-            elif mlip_name == "uma":
-                default_config = {"task": "omat", "device": "cpu"}
-            else:
-                default_config = {"device": "cpu"}
-
-            # Merge user config with defaults (user config takes precedence)
-            final_config = {**default_config, **mlip_config}
+            final_config = _merge_model_config(
+                mlip_name, mlip_configs.get(mlip_name, {})
+            )
 
             logger.info(f"Will load {mlip_name} with config: {final_config}")
 
@@ -322,23 +318,9 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
             calculators = {}
             for mlip_name in mlip_names:
                 try:
-                    mlip_config = mlip_configs.get(mlip_name, {})
-
-                    # Use specific default configurations for each MLIP
-                    if mlip_name == "mace":
-                        default_config = {"model_type": "mp", "device": "cpu"}
-                    elif mlip_name == "orb":
-                        default_config = {
-                            "model_type": "orb_v3_conservative_inf_omat",
-                            "device": "cpu",
-                        }
-                    elif mlip_name == "uma":
-                        default_config = {"task": "omat", "device": "cpu"}
-                    else:
-                        default_config = {"device": "cpu"}
-
-                    # Merge user config with defaults (user config takes precedence)
-                    final_config = {**default_config, **mlip_config}
+                    final_config = _merge_model_config(
+                        mlip_name, mlip_configs.get(mlip_name, {})
+                    )
 
                     calculators[mlip_name] = _get_or_create_calculator(
                         mlip_name, final_config
@@ -351,23 +333,6 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
 
             # Storage for results from each MLIP
             mlip_results = {}
-
-            # Storage for scalar metrics for statistical analysis
-            scalar_metrics = {
-                "energy": [],
-                "formation_energy": [],
-                "e_above_hull": [],
-                "relaxation_energy": [],
-                "relaxation_rmse": [],
-                "relaxation_steps": [],
-                "relaxed_formation_energy": [],
-                "relaxed_e_above_hull": [],
-            }
-
-            # Storage for vector metrics (to be averaged)
-            vector_metrics = {
-                "forces": [],
-            }
 
             # Process with each MLIP
             for mlip_name, calculator in calculators.items():
@@ -392,18 +357,6 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
 
                     mlip_results[mlip_name] = mlip_result
 
-                    # Collect scalar metrics for statistics
-                    for metric_name in scalar_metrics.keys():
-                        if (
-                            metric_name in mlip_result
-                            and mlip_result[metric_name] is not None
-                        ):
-                            scalar_metrics[metric_name].append(mlip_result[metric_name])
-
-                    # Collect vector metrics for averaging
-                    if "forces" in mlip_result and mlip_result["forces"] is not None:
-                        vector_metrics["forces"].append(mlip_result["forces"])
-
                 except FunctionTimedOut:
                     logger.warning(
                         f"Timeout processing {structure.formula} with {mlip_name}"
@@ -415,16 +368,7 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
                     )
                     mlip_results[mlip_name] = {"error": str(e)}
 
-            # Store individual MLIP results
-            for mlip_name, result in mlip_results.items():
-                if "error" not in result:
-                    _store_mlip_properties(structure, mlip_name, result)
-
-            # Calculate and store ensemble statistics
-            _calculate_ensemble_statistics(structure, scalar_metrics, vector_metrics)
-
-            # Create a clean copy of the structure before returning (for multiprocessing serialization)
-            clean_structure = _create_clean_structure_copy(structure)
+            clean_structure = _merge_mlip_results(structure, mlip_results)
 
             # Clear memory in worker process
             _clear_worker_memory()
@@ -434,6 +378,34 @@ class MultiMLIPStabilityPreprocessor(BasePreprocessor):
         except Exception as e:
             logger.error(f"Failed to process structure {structure.formula}: {str(e)}")
             raise
+
+
+def _merge_mlip_results(
+    structure: Structure, mlip_results: Dict[str, Any]
+) -> Structure:
+    """Store model properties and ensemble statistics in model insertion order."""
+    scalar_metrics = {
+        "energy": [],
+        "formation_energy": [],
+        "e_above_hull": [],
+        "relaxation_energy": [],
+        "relaxation_rmse": [],
+        "relaxation_steps": [],
+        "relaxed_formation_energy": [],
+        "relaxed_e_above_hull": [],
+    }
+    vector_metrics = {"forces": []}
+    for mlip_name, result in mlip_results.items():
+        if "error" in result:
+            continue
+        for metric_name in scalar_metrics:
+            if metric_name in result and result[metric_name] is not None:
+                scalar_metrics[metric_name].append(result[metric_name])
+        if result.get("forces") is not None:
+            vector_metrics["forces"].append(result["forces"])
+        _store_mlip_properties(structure, mlip_name, result)
+    _calculate_ensemble_statistics(structure, scalar_metrics, vector_metrics)
+    return _create_clean_structure_copy(structure)
 
 
 def _process_single_mlip(
